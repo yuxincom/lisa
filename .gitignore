@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+backend/.venv/
+.pytest_cache/
+
+# Runtime data and secrets
+backend/data/*.db
+backend/data/*.db-journal
+.env
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# Temporary artifacts
+.tmp-*

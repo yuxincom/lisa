@@ -1,0 +1,24 @@
+[Unit]
+Description=LISA Liyang Intelligent Scheduling Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lisa
+Group=lisa
+WorkingDirectory=/opt/lisa
+EnvironmentFile=/etc/lisa/lisa.env
+Environment=LISA_ENV=production
+Environment=LISA_DATA_DIR=/var/lib/lisa
+ExecStart=/opt/lisa/backend/.venv/bin/python -m uvicorn app.main:app --app-dir /opt/lisa/backend --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/lisa
+
+[Install]
+WantedBy=multi-user.target

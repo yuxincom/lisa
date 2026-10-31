@@ -1,0 +1,30 @@
+services:
+  lisa:
+    build:
+      context: .
+    image: lisa-liyang:1.0.0
+    container_name: lisa
+    restart: unless-stopped
+    ports:
+      - "${LISA_PORT:-8000}:8000"
+    environment:
+      LISA_ENV: production
+      LISA_SEED: "1"
+      LISA_TZ_OFFSET: "8"
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env before starting}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:8000}"
+      LISA_PASSWORD_ADMIN: "${LISA_PASSWORD_ADMIN:-}"
+      LISA_PASSWORD_COMMANDER: "${LISA_PASSWORD_COMMANDER:-}"
+      LISA_PASSWORD_PLANNER: "${LISA_PASSWORD_PLANNER:-}"
+      LISA_PASSWORD_DISPATCHER: "${LISA_PASSWORD_DISPATCHER:-}"
+      LISA_PASSWORD_ENGINEER: "${LISA_PASSWORD_ENGINEER:-}"
+      LISA_PASSWORD_EXPERT: "${LISA_PASSWORD_EXPERT:-}"
+    volumes:
+      - lisa-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+
+volumes:
+  lisa-data:
+    name: lisa-data
