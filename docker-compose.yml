@@ -9,8 +9,10 @@ services:
       - "${LISA_PORT:-8000}:8000"
     environment:
       LISA_ENV: production
-      LISA_SEED: "1"
+
+      LISA_SEED: "${LISA_SEED:-1}"
       LISA_TZ_OFFSET: "8"
+      DATABASE_URL: "${DATABASE_URL:-}"
       JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env before starting}"
       CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:8000}"
       LISA_PASSWORD_ADMIN: "${LISA_PASSWORD_ADMIN:-}"
