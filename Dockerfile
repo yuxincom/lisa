@@ -1,13 +1,19 @@
-# syntax=docker/dockerfile:1
+ARG NODE_IMAGE=node:22-alpine
+ARG PYTHON_IMAGE=python:3.12-slim
+ARG NPM_REGISTRY=
+ARG PIP_INDEX_URL=
 
-FROM node:22-alpine AS web
+FROM ${NODE_IMAGE} AS web
+ARG NPM_REGISTRY
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi \
+    && npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
-FROM python:3.12-slim AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
+ARG PIP_INDEX_URL
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -19,7 +25,11 @@ RUN groupadd --gid 10001 lisa \
     && useradd --uid 10001 --gid lisa --create-home lisa
 
 COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+RUN if [ -n "$PIP_INDEX_URL" ]; then \
+      pip install --no-cache-dir -i "$PIP_INDEX_URL" -r backend/requirements.txt; \
+    else \
+      pip install --no-cache-dir -r backend/requirements.txt; \
+    fi
 
 COPY backend/app ./backend/app
 COPY --from=web /build/dist ./frontend/dist

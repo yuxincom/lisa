@@ -2,6 +2,15 @@ services:
   lisa:
     build:
       context: .
+      args:
+        # 国内服务器拉不到 Docker Hub 时，在 .env 里给这两个变量加镜像站前缀，
+        # 例如 NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine
+        NODE_IMAGE: "${NODE_IMAGE:-node:22-alpine}"
+        PYTHON_IMAGE: "${PYTHON_IMAGE:-python:3.12-slim}"
+        # 依赖源同样可替换：NPM_REGISTRY=https://registry.npmmirror.com
+        #                 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+        NPM_REGISTRY: "${NPM_REGISTRY:-}"
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-}"
     image: lisa-liyang:1.0.0
     container_name: lisa
     restart: unless-stopped
@@ -9,7 +18,6 @@ services:
       - "${LISA_PORT:-8000}:8000"
     environment:
       LISA_ENV: production
-
       LISA_SEED: "${LISA_SEED:-1}"
       LISA_TZ_OFFSET: "8"
       DATABASE_URL: "${DATABASE_URL:-}"
