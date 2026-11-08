@@ -1,0 +1,4 @@
+code,product_code,category,name,unit,qty_per,lead_time_days,supplier
+MT-LY001-M,LY-001,main_material,GH4169 真空自耗锭,kg,42,120,抚顺特钢
+MT-LY001-A,LY-001,aux_material,耐热垫片,件,12,30,本地配套
+MT-LY002-M,LY-002,main_material,Ti-6Al-4V 锻棒,kg,28,90,宝钛股份

@@ -166,6 +166,7 @@ export function statusTone(status?: string | null): string {
     case 'fatal':
     case 'critical':
     case '缺项':
+    case '缺料':
     case '阻断':
     case '逾期':
     case 'degraded':
@@ -173,6 +174,7 @@ export function statusTone(status?: string | null): string {
     case 'superseded':
     case '已关闭':
     case '已完工':
+    case '待接入':
       return 'muted'
     case 'expired':
       return 'muted'

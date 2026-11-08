@@ -16,3 +16,10 @@ frontend/*.tsbuildinfo
 
 # Temporary artifacts
 .tmp-*
+
+# IDE and scratch
+.idea/
+.scratch/
+
+# Server logs
+backend/uvicorn*.log

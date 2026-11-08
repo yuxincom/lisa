@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from ..config import APP_VERSION
@@ -15,7 +16,11 @@ from ..models import (
     Plan,
     PlanItem,
     Resource,
+    Rule,
+    User,
 )
+from . import clearance
+from . import plants
 from .kits import kit_overview
 from .quality import quality_summary
 from .serializers import (
@@ -57,7 +62,14 @@ def _status(value: float, target: float, higher_better: bool) -> str:
     return "bad"
 
 
-def kpi_cards(db: Session) -> list[dict]:
+def kpi_cards(db: Session, user: User | None = None, cfg: dict | None = None, pcfg: dict | None = None) -> list[dict]:
+    """user/cfg 一起给时才做密级过滤：KPI 是给「某个人看」的数字时，分母也必须是
+    那个人读得到的集合，否则准时率里混进了他无权知道的工单。cfg 为空 = 系统内部口径。"""
+    cfg = cfg or {}
+    pcfg = pcfg or {}
+    order_filter = and_(clearance.visible_filter(user, Order.clearance, cfg),
+                        plants.visible_filter(user, Order.plant, pcfg))
+    order_scope = plants.visible_order_ids(user, cfg, pcfg)
     baseline = latest_baseline(db)
     kpi = (baseline.kpi if baseline else {}) or {}
     decided = (
@@ -87,10 +99,10 @@ def kpi_cards(db: Session) -> list[dict]:
     local_values = [r.output.get("simulated_minutes", 27.0) for r in local_runs if r.output]
     local_current = local_values[-1] if local_values else 27.0
 
-    kit = kit_overview(db)
+    kit = kit_overview(db, order_scope)
     kit_rate = kit["post_schedule_rate"]
 
-    completed = db.query(Order).filter(Order.status == "已完工").all()
+    completed = db.query(Order).filter(order_filter, Order.status == "已完工").all()
     trial_ok = 0
     for order in completed:
         ops = db.query(Operation).filter(Operation.order_id == order.id, Operation.domain == "试车").all()
@@ -201,11 +213,26 @@ def kpi_cards(db: Session) -> list[dict]:
     ]
 
 
-def dashboard_overview(db: Session) -> dict:
+def dashboard_overview(db: Session, user: User | None = None, cfg: dict | None = None, pcfg: dict | None = None) -> dict:
+    cfg = cfg or {}
+    pcfg = pcfg or {}
+    order_filter = and_(clearance.visible_filter(user, Order.clearance, cfg),
+                        plants.visible_filter(user, Order.plant, pcfg))
+    order_scope = plants.visible_order_ids(user, cfg, pcfg)
     baseline = latest_baseline(db)
-    items = db.query(PlanItem).filter(PlanItem.plan_id == baseline.id).all() if baseline else []
+    items = []
+    if baseline:
+        item_query = db.query(PlanItem).filter(PlanItem.plan_id == baseline.id)
+        if order_scope is not None:
+            item_query = item_query.filter(PlanItem.order_id.in_(order_scope))
+        items = item_query.all()
     resources = {r.id: r for r in db.query(Resource).all()}
     kpi = (baseline.kpi if baseline else {}) or {}
+    rule_rows = db.query(Rule.kind, func.count(Rule.id)).group_by(Rule.kind).all()
+    rule_totals = {kind: count for kind, count in rule_rows}
+    hard_total = rule_totals.get("hard", 0)
+    soft_total = rule_totals.get("soft", 0)
+    rule_total = rule_totals.get("rule", 0)
 
     if items:
         span_days = max(1.0, (max(i.end for i in items) - min(i.start for i in items)).days)
@@ -308,13 +335,14 @@ def dashboard_overview(db: Session) -> dict:
 
     changes = (
         db.query(Disturbance)
+        .filter(clearance.visible_filter(user, Disturbance.clearance, cfg))
         .order_by(Disturbance.occurred_at.desc())
         .limit(5)
         .all()
     )
     order_counts = {}
     for status in ["待排产", "已排产", "执行中", "逾期", "已完工", "冻结"]:
-        order_counts[status] = db.query(Order).filter(Order.status == status).count()
+        order_counts[status] = db.query(Order).filter(order_filter, Order.status == status).count()
 
     plan_counts = {}
     for status in ["pending", "applied", "rejected", "superseded", "blocked"]:
@@ -323,10 +351,10 @@ def dashboard_overview(db: Session) -> dict:
     recent_runs = db.query(AgentRun).order_by(AgentRun.started_at.desc()).limit(6).all()
     audit_tail = db.query(AuditLog).order_by(AuditLog.seq.desc()).limit(7).all()
     quality = quality_summary(db)
-    kit = kit_overview(db)
+    kit = kit_overview(db, order_scope)
 
     return {
-        "kpis": kpi_cards(db),
+        "kpis": kpi_cards(db, user, cfg, pcfg),
         "baseline": {
             "id": baseline.id if baseline else None,
             "code": baseline.code if baseline else None,
@@ -357,8 +385,14 @@ def dashboard_overview(db: Session) -> dict:
             ],
         },
         "kit": kit,
-        "changes": [change_to_dict(c) for c in changes],
+        "changes": [change_to_dict(c, user, cfg) for c in changes],
         "risk_orders": risk_orders,
+        "clearance": {
+            "enabled": bool(cfg.get("enabled")),
+            "your_level": getattr(user, "clearance", "") or None,
+            "levels": cfg.get("levels", []),
+            "hidden_orders": clearance.hidden_breakdown(db, Order, user, cfg) if user is not None else {},
+        },
         "recent_runs": [
             {
                 "code": r.code,
@@ -375,9 +409,11 @@ def dashboard_overview(db: Session) -> dict:
         "system": {
             "version": APP_VERSION,
             "generated_at": datetime.now().replace(microsecond=0).isoformat(),
-            "solver": "LISA Heuristic Engine",
-            "rule_engine": "ZD-01-2026 · 68 rules",
-            "constraints": "HC-01~14 / SC-01~13",
+            "solver": "LISA Heuristic Engine（贪心派工，无外部求解器）",
+            "rule_engine": (
+                f"ZD-01-2026 · 硬约束 {hard_total} / 软约束 {soft_total} / 业务规则 {rule_total}"
+            ),
+            "constraints": f"HC-01~{hard_total} / SC-01~{soft_total}",
             "write_shield": "active",
         },
     }

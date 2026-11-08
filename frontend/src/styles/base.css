@@ -427,6 +427,31 @@ ol {
   border: 1px solid var(--border);
 }
 
+/* ---------- Clearance ---------- */
+.clearance-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 11px 14px;
+  margin-bottom: 14px;
+  border: 1px solid color-mix(in srgb, var(--warning) 32%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.clearance-note strong {
+  color: var(--warning);
+  font-weight: 700;
+}
+
+.meta-hidden {
+  color: var(--warning);
+  font-weight: 600;
+}
+
 /* ---------- Forms ---------- */
 .field {
   display: flex;

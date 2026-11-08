@@ -29,6 +29,22 @@ services:
       LISA_PASSWORD_DISPATCHER: "${LISA_PASSWORD_DISPATCHER:-}"
       LISA_PASSWORD_ENGINEER: "${LISA_PASSWORD_ENGINEER:-}"
       LISA_PASSWORD_EXPERT: "${LISA_PASSWORD_EXPERT:-}"
+      # 主数据接入通道凭据：只传环境变量名对应的值，配置界面里永远只写变量名
+      LISA_ERP_TOKEN: "${LISA_ERP_TOKEN:-}"
+      LISA_MES_DSN: "${LISA_MES_DSN:-}"
+      LISA_ADAPTER_POLL_SECONDS: "${LISA_ADAPTER_POLL_SECONDS:-0}"
+      # 内网模型编排凭据：留空则模型自动降级为确定性编排，排产不受影响
+      LISA_LLM_API_KEY: "${LISA_LLM_API_KEY:-}"
+      # 审计链外部锚点密钥：留空则 /api/audit/anchor 明确拒绝锚定
+      LISA_ANCHOR_SECRET: "${LISA_ANCHOR_SECRET:-}"
+      LISA_ANCHOR_SECRET_ENV: "${LISA_ANCHOR_SECRET_ENV:-LISA_ANCHOR_SECRET}"
+      # 后台任务队列：多副本时只让一个副本当工人，其余置 0
+      LISA_JOB_WORKER: "${LISA_JOB_WORKER:-1}"
+      LISA_JOB_POLL_SECONDS: "${LISA_JOB_POLL_SECONDS:-1.5}"
+      LISA_WORKER_ID: "${LISA_WORKER_ID:-}"
+      # 整库快照：留空则落在 lisa-data 卷的 backups 目录
+      LISA_BACKUP_DIR: "${LISA_BACKUP_DIR:-}"
+      LISA_BACKUP_KEEP: "${LISA_BACKUP_KEEP:-14}"
     volumes:
       - lisa-data:/app/data
     security_opt:

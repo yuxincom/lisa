@@ -1,0 +1,4 @@
+material_code,on_hand,allocated,quality_status,batch,location
+MT-LY001-M,120,30,合格,B2601,一厂立体库
+MT-LY001-A,40,0,合格,B2601,一厂立体库
+MT-LY002-M,10,0,待判,B2512,二厂立体库

@@ -47,6 +47,10 @@ def append_audit(
     detail: dict | None = None,
     clearance: str = "内部",
 ) -> AuditLog:
+    # 列宽是硬限制：PostgreSQL 上超长直接报错，审计写失败会把整个业务请求一起带崩
+    actor, role, action = actor[:64], role[:32], action[:64]
+    target_type, target_id = target_type[:32], str(target_id)[:40]
+    result, clearance = result[:16], clearance[:16]
     last = db.query(AuditLog).order_by(AuditLog.seq.desc()).first()
     seq = (last.seq + 1) if last else 1
     prev_hash = last.hash if last else GENESIS_HASH

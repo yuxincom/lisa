@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.orm import Session
 
 from ..config import (
@@ -17,7 +17,7 @@ from ..config import (
     ROLE_PERMISSIONS,
 )
 from ..database import engine, get_db
-from ..deps import get_current_user, require
+from ..deps import clearance_cfg, get_current_user, plant_cfg, require
 from ..models import (
     AgentRun,
     Alert,
@@ -26,12 +26,30 @@ from ..models import (
     Operation,
     Order,
     Plan,
+    PlanItem,
     Resource,
     Rule,
     User,
 )
-from ..schemas import SettingsUpdate
+from ..schemas import (
+    AdapterConfigUpdate,
+    AdapterRunRequest,
+    BackupVerifyRequest,
+    KitDataUpdate,
+    KnowledgeImportUpdate,
+    MachineLedgerUpdate,
+    SettingsUpdate,
+    UserScopeUpdate,
+)
+from ..services import backup as bk
+from ..services import clearance as clr
+from ..services import plants as pl
 from ..services.audit import log_user_action
+from ..services.adapters import AdapterError, adapter_overview, run_due
+from ..services.kit_data import KIT_COLUMNS, KitDataError, data_freshness, upsert_rows
+from ..services.knowledge import KNOWLEDGE_COLUMNS, KnowledgeImportError, import_rows as import_knowledge_rows
+from ..services.maindata import LedgerError, apply_dependencies, apply_machine_ledger
+from ..services.calendar import CalendarConfigError, active_calendar, apply_calendar_config, validate_calendar_config
 from ..services.serializers import audit_to_dict, user_to_dict
 from ..services.settings import SCENARIO_META, all_settings, get_setting, set_setting
 
@@ -52,10 +70,13 @@ PERMISSION_LABELS = {
     "data:read": "数据基座",
     "knowledge:read": "知识规则",
     "audit:read": "审计追溯",
+    "audit:anchor": "审计锚定",
     "alerts:read": "告警查看",
     "alerts:ack": "告警确认",
     "settings:read": "设置查看",
     "export:read": "数据导出",
+    "jobs:read": "任务队列查看",
+    "jobs:cancel": "任务取消",
 }
 
 
@@ -107,23 +128,135 @@ def update_settings(
     if user.role != "admin":
         raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可修改全局参数"})
     allowed = {
-        "weights", "thresholds", "freeze_days", "shift", "approval_timeout_minutes",
-        "solver_timeout_seconds", "auto_escalate", "write_shield",
+        "weights", "thresholds", "freeze_days", "shift", "calendar", "approval_timeout_minutes",
+        "solver_timeout_seconds", "auto_escalate", "write_shield", "clearance", "plants",
     }
     updated = {}
     for key, value in payload.values.items():
         if key not in allowed:
             continue
+        if key == "calendar":
+            try:
+                validate_calendar_config(value)
+            except CalendarConfigError as exc:
+                raise HTTPException(status_code=422, detail={"code": "CALENDAR_INVALID", "message": str(exc)}) from exc
+        if key == "clearance":
+            try:
+                value = clr.normalize(value)
+            except clr.ClearanceError as exc:
+                raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message}) from exc
+        if key == "plants":
+            try:
+                value = pl.normalize(value)
+            except pl.PlantError as exc:
+                raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message}) from exc
         updated[key] = set_setting(db, key, value)
     log_user_action(db, user, "settings.update", "settings", "global", detail={"keys": list(updated.keys()), "values": updated})
     db.commit()
+    if "calendar" in updated:
+        apply_calendar_config(all_settings(db)["calendar"])
     return {"values": all_settings(db), "updated": list(updated.keys())}
+
+
+@router.get("/calendar")
+def calendar_status(db: Session = Depends(get_db), user: User = Depends(require("settings:read"))):
+    """当前真正生效的工作日历，以及未来 14 天的产能栅格。"""
+    calendar = active_calendar()
+    lanes = [
+        max(1, int(count or 1))
+        for (count,) in db.query(Resource.machine_count).filter(Resource.status != "offline").all()
+    ]
+    total_lanes = sum(lanes)
+    today = date.today()
+    grid = []
+    for offset in range(14):
+        day = today + timedelta(days=offset)
+        capacity = calendar.day_capacity_minutes(day)
+        grid.append(
+            {
+                "date": day.isoformat(),
+                "weekday": day.weekday(),
+                "production_day": calendar.is_production_day(day),
+                "shift_minutes": round(capacity, 1),
+                "machine_capacity_minutes": round(capacity * total_lanes, 1),
+            }
+        )
+    return {
+        "effective": calendar.to_config(),
+        "stored": get_setting(db, "calendar", None),
+        "resources": {"count": len(lanes), "lanes": total_lanes},
+        "grid": grid,
+    }
+
+
+@router.put("/calendar")
+def update_calendar(
+    payload: SettingsUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可修改工作日历"})
+    try:
+        validate_calendar_config(payload.values)
+    except CalendarConfigError as exc:
+        raise HTTPException(status_code=422, detail={"code": "CALENDAR_INVALID", "message": str(exc)}) from exc
+    stored = set_setting(db, "calendar", payload.values)
+    log_user_action(db, user, "calendar.update", "settings", "calendar", detail={"config": stored})
+    db.commit()
+    calendar = apply_calendar_config(stored)
+    return {"effective": calendar.to_config(), "applied": True}
 
 
 @router.get("/users")
 def users(db: Session = Depends(get_db), user: User = Depends(require("settings:read"))):
     rows = db.query(User).order_by(User.id).all()
-    return {"items": [user_to_dict(u) for u in rows]}
+    return {"items": [user_to_dict(u) for u in rows], "plants": pl.config(db)["names"]}
+
+
+@router.put("/users/{username}/scope")
+def update_user_scope(
+    username: str,
+    payload: UserScopeUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    """给账号配读取范围：厂区 + 密级。投产时按人头逐条落实，别靠「大家都看全部」。"""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可调整账号读取范围"})
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND", "message": "账号不存在"})
+    plant_cfg = pl.config(db)
+    claimed = [str(x).strip() for x in (payload.plants or []) if str(x).strip()]
+    if len(set(claimed)) != len(claimed):
+        raise HTTPException(status_code=422, detail={"code": "PLANT_SCOPE_INVALID", "message": "厂区范围里有重名"})
+    unknown = [name for name in claimed if name not in plant_cfg["names"]]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "PLANT_SCOPE_INVALID",
+                    "message": f"厂区 {', '.join(unknown)} 不在厂区清单里（清单：{', '.join(plant_cfg['names'])}）"},
+        )
+    clearance_cfg = clr.config(db)
+    level = (payload.clearance or "").strip()
+    if level and level not in clearance_cfg["levels"]:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CLEARANCE_LEVELS_INVALID",
+                    "message": f"密级 {level} 不在等级表里（等级表：{', '.join(clearance_cfg['levels'])}）"},
+        )
+    before = {"plants": list(target.plants or []), "clearance": target.clearance}
+    target.plants = claimed
+    if level:
+        target.clearance = level
+    log_user_action(
+        db, user, "user.scope_update", "user", target.username,
+        detail={"before": before, "after": {"plants": claimed, "clearance": target.clearance}},
+    )
+    db.commit()
+    db.refresh(target)
+    return user_to_dict(target)
 
 
 @router.get("/security")
@@ -168,6 +301,8 @@ def security(db: Session = Depends(get_db), user: User = Depends(require("settin
             "levels": ["计划员择优", "生产指挥部终审", "15min 未审自动升级"],
             "algorithm": "PBKDF2-SHA256 身份校验 + 签名摘要",
         },
+        "clearance": clr.report(db, user),
+        "plants": pl.report(db, user),
     }
 
 
@@ -187,26 +322,232 @@ def test_write_shield(db: Session = Depends(get_db), user: User = Depends(get_cu
     }
 
 
+@router.post("/main-data/machine-ledger")
+def import_machine_ledger(
+    payload: MachineLedgerUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可导入产能主数据"})
+    try:
+        result = apply_machine_ledger(db, payload.items, user)
+    except LedgerError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message})
+    db.commit()
+    return result
+
+
+@router.post("/main-data/operation-dependencies")
+def import_operation_dependencies(
+    payload: MachineLedgerUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可导入工序依赖"})
+    try:
+        result = apply_dependencies(db, payload.items, user)
+    except LedgerError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message})
+    db.commit()
+    return result
+
+
+@router.post("/main-data/kit-data")
+def import_kit_data(
+    payload: KitDataUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    """齐套外部主数据（D 组）的 JSON 通道：ERP BOM / WMS 库存 / 在途 / 工装刀具 / 资质 / 检验结论。"""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可导入外部主数据"})
+    try:
+        result = upsert_rows(db, payload.kind, payload.items, user)
+    except (KitDataError, LedgerError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message})
+    if payload.dry_run:
+        db.rollback()
+        result["dry_run"] = True
+        return result
+    db.commit()
+    return result
+
+
+@router.get("/main-data/knowledge-columns")
+def knowledge_columns(user: User = Depends(require("data:read"))):
+    """F6 语料模板的表头与受控值域，页面/脚本按这个生成 CSV。"""
+    return {"columns": list(KNOWLEDGE_COLUMNS), "categories": ["专识", "通识"]}
+
+
+@router.post("/main-data/knowledge")
+def import_knowledge_corpus(
+    payload: KnowledgeImportUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    """知识语料（F6）入库：按 code upsert，非法行整批拒绝，导入动作写审计链。"""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可导入知识语料"})
+    try:
+        result = import_knowledge_rows(db, payload.items, user)
+    except (KnowledgeImportError, LedgerError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message})
+    if payload.dry_run:
+        db.rollback()
+        result["dry_run"] = True
+        return result
+    db.commit()
+    return result
+
+
+@router.get("/main-data/kit-sources")
+def kit_source_freshness(db: Session = Depends(get_db), user: User = Depends(require("data:read"))):
+    return data_freshness(db)
+
+
+@router.get("/main-data/adapters")
+def list_adapters(db: Session = Depends(get_db), user: User = Depends(require("data:read"))):
+    return adapter_overview(db)
+
+
+@router.put("/main-data/adapters")
+def save_adapters(
+    payload: AdapterConfigUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可配置接入通道"})
+    for source in payload.sources:
+        if not isinstance(source, dict):
+            raise HTTPException(status_code=422, detail={"code": "ADAPTER_CONFIG_INVALID", "message": "通道配置必须是对象列表"})
+        kind = str(source.get("kind") or "")
+        channel = str(source.get("channel") or "")
+        if kind not in KIT_COLUMNS:
+            raise HTTPException(status_code=422, detail={"code": "ADAPTER_KIND_UNKNOWN", "message": f"未知的齐套数据类型：{kind}"})
+        if channel not in {"file", "http", "db"}:
+            raise HTTPException(status_code=422, detail={"code": "ADAPTER_CHANNEL_UNKNOWN", "message": f"未知通道：{channel}"})
+        if channel == "http" and not str(source.get("url", "")).startswith("https://"):
+            raise HTTPException(status_code=422, detail={"code": "ADAPTER_URL_INSECURE", "message": "HTTP 通道只允许 https"})
+        if channel == "db" and not str(source.get("sql", "")).strip().lower().startswith("select"):
+            raise HTTPException(status_code=422, detail={"code": "ADAPTER_SQL_NOT_READONLY", "message": "中间库通道只允许 SELECT"})
+    set_setting(db, "adapters", {"sources": payload.sources})
+    log_user_action(db, user, "maindata.adapters_config", "adapter", "config", detail={"sources": len(payload.sources)})
+    db.commit()
+    return {"sources": len(payload.sources)}
+
+
+@router.post("/main-data/adapters/run")
+def run_adapters(
+    payload: AdapterRunRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可触发外部同步"})
+    try:
+        return run_due(db, user, force=payload.force)
+    except (AdapterError, KitDataError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message})
+
+
+@router.get("/backups")
+def list_backups(db: Session = Depends(get_db), user: User = Depends(require("settings:read"))):
+    """快照清单：让运维在页面上确认「最近一次备份还在不在」，恢复本身不开放 HTTP。"""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可查看备份"})
+    return {
+        "items": bk.list_backups(),
+        "backup_dir": str(bk.backup_dir()),
+        "keep": bk.keep_count(),
+        "dialect": engine.dialect.name,
+        "native": bk.native_commands(),
+        "restore": "停服后执行 python -m app.management restore <文件名> --yes",
+    }
+
+
+@router.post("/backups")
+def create_backup(db: Session = Depends(get_db), user: User = Depends(require("settings:read"))):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可创建备份"})
+    try:
+        summary = bk.create(db)
+    except bk.BackupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message})
+    log_user_action(
+        db, user, "backup.create", "backup", summary["audit_ref"],
+        detail={"file": summary["file"], "total_rows": summary["total_rows"], "checksum": summary["checksum"]},
+    )
+    db.commit()
+    return summary
+
+
+@router.post("/backups/verify")
+def verify_backup(
+    payload: BackupVerifyRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require("settings:read")),
+):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": "ABAC_DENIED", "message": "仅系统管理员可校验备份"})
+    try:
+        result = bk.verify(bk.resolve_name(payload.name))
+    except bk.BackupError as exc:
+        # 校验不过的备份是安全事件，失败也要留在审计链里
+        log_user_action(
+            db, user, "backup.verify", "backup", payload.name[:40], result="failed",
+            detail={"code": exc.code, "message": exc.message},
+        )
+        db.commit()
+        status = 404 if exc.code == "BACKUP_FILE_MISSING" else 422
+        raise HTTPException(status_code=status, detail={"code": exc.code, "message": exc.message})
+    log_user_action(db, user, "backup.verify", "backup", bk.audit_ref(result["file"]), detail={"checksum": result["checksum"]})
+    db.commit()
+    return result
+
+
 @router.get("/search")
 def global_search(
     q: str = Query(..., min_length=1, max_length=80),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    cfg, pcfg = clearance_cfg(db), plant_cfg(db)
     like = f"%{q}%"
     orders = (
         db.query(Order)
-        .filter((Order.order_no.like(like)) | (Order.product_name.like(like)))
+        .filter(
+            clr.visible_filter(user, Order.clearance, cfg),
+            pl.visible_filter(user, Order.plant, pcfg),
+            (Order.order_no.like(like)) | (Order.product_name.like(like)),
+        )
         .order_by(Order.due_date.asc()).limit(5).all()
     )
-    plans = (
+    plan_scope = pl.visible_order_ids(user, cfg, pcfg)
+    plan_query = (
         db.query(Plan)
         .filter((Plan.code.like(like)) | (Plan.name.like(like)))
-        .order_by(Plan.created_at.desc()).limit(5).all()
     )
+    if plan_scope is not None:
+        # 方案本身没有密级列：按它包含的工单密级判定，含读不到的工单就不出现在搜索里
+        plan_query = plan_query.filter(
+            Plan.id.in_(select(PlanItem.plan_id).where(PlanItem.order_id.in_(plan_scope)).scalar_subquery())
+        )
+    plans = plan_query.order_by(Plan.created_at.desc()).limit(5).all()
     changes = (
         db.query(Disturbance)
-        .filter((Disturbance.code.like(like)) | (Disturbance.title.like(like)))
+        .filter(
+            clr.visible_filter(user, Disturbance.clearance, cfg),
+            (Disturbance.code.like(like)) | (Disturbance.title.like(like)),
+        )
         .order_by(Disturbance.occurred_at.desc()).limit(5).all()
     )
     return {
@@ -214,15 +555,25 @@ def global_search(
         "orders": [{"id": o.id, "title": o.order_no, "subtitle": o.product_name, "status": o.status, "priority": o.priority} for o in orders],
         "plans": [{"id": p.id, "title": p.code, "subtitle": p.name, "status": p.status} for p in plans],
         "changes": [{"id": c.id, "title": c.code, "subtitle": c.title, "status": c.status} for c in changes],
+        "hidden_by_clearance": clr.hidden_count(db, Order, user, cfg),
+        "hidden_by_plant": pl.hidden_count(db, Order, user, pcfg),
+        "clearance_enabled": cfg["enabled"],
+        "plants_enabled": pcfg["enabled"],
     }
 
 
 @router.get("/stats")
 def stats(db: Session = Depends(get_db), user: User = Depends(require("settings:read"))):
+    cfg, pcfg = clearance_cfg(db), plant_cfg(db)
+    order_scope = and_(clr.visible_filter(user, Order.clearance, cfg),
+                       pl.visible_filter(user, Order.plant, pcfg))
+    hidden = clr.hidden_count(db, Order, user, cfg) + pl.hidden_count(db, Order, user, pcfg)
     return {
-        "orders": db.query(Order).count(),
+        "orders": db.query(Order).filter(order_scope).count(),
+        "orders_total_ungated": db.query(Order).count() if (cfg["enabled"] or pcfg["enabled"]) else None,
+        "orders_hidden_by_clearance": hidden,
         "operations": db.query(Operation).count(),
-        "resources": db.query(Resource).count(),
+        "resources": db.query(Resource).filter(pl.visible_filter(user, Resource.plant, pcfg)).count(),
         "plans": db.query(Plan).count(),
         "rules": db.query(Rule).count(),
         "agent_runs": db.query(AgentRun).count(),
@@ -234,17 +585,32 @@ def stats(db: Session = Depends(get_db), user: User = Depends(require("settings:
 
 @router.get("/export/orders.csv")
 def export_orders(db: Session = Depends(get_db), user: User = Depends(require("export:read"))):
-    rows = db.query(Order).order_by(Order.order_no).limit(5000).all()
+    cfg, pcfg = clearance_cfg(db), plant_cfg(db)
+    rows = (
+        db.query(Order)
+        .filter(clr.visible_filter(user, Order.clearance, cfg), pl.visible_filter(user, Order.plant, pcfg))
+        .order_by(Order.order_no).limit(5000).all()
+    )
+    hidden = clr.hidden_count(db, Order, user, cfg) + pl.hidden_count(db, Order, user, pcfg)
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["订单号", "产品", "数量", "优先级", "厂区", "客户", "交期", "状态", "进度", "齐套状态"])
+    writer.writerow(["订单号", "产品", "数量", "优先级", "厂区", "客户", "交期", "状态", "进度", "齐套状态", "密级"])
     for o in rows:
-        writer.writerow([o.order_no, o.product_name, o.qty, o.priority, o.plant, o.customer, o.due_date.strftime("%Y-%m-%d"), o.status, o.progress, o.kit_status])
+        writer.writerow([o.order_no, o.product_name, o.qty, o.priority, o.plant, o.customer, o.due_date.strftime("%Y-%m-%d"), o.status, o.progress, o.kit_status, o.clearance or cfg["data_default"]])
     content = "\ufeff" + buffer.getvalue()
+    log_user_action(
+        db, user, "export.orders", "orders", "csv",
+        detail={"rows": len(rows), "hidden_by_clearance": hidden, "limit": 5000},
+    )
+    db.commit()
     return StreamingResponse(
         iter([content]),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=lisa-orders.csv"},
+        headers={
+            "Content-Disposition": "attachment; filename=lisa-orders.csv",
+            "X-Lisa-Exported-Rows": str(len(rows)),
+            "X-Lisa-Hidden-By-Clearance": str(hidden),
+        },
     )
 
 

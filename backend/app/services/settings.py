@@ -12,10 +12,42 @@ DEFAULT_SETTINGS: dict = {
     "thresholds": {"data_quality": 90, "confidence": 0.7, "kit": 100},
     "freeze_days": 3,
     "shift": {"start": 8, "end": 20, "days": 6},
+    "calendar": {
+        "shifts": [{"name": "白班", "start": "08:00", "end": "20:00"}],
+        "workdays": [0, 1, 2, 3, 4, 5],
+        "holidays": [],
+        "workday_overrides": [],
+        "horizon_days": 400,
+    },
     "approval_timeout_minutes": 15,
     "solver_timeout_seconds": 15,
     "auto_escalate": True,
     "write_shield": True,
+    "adapters": {"sources": []},
+    "clearance": {
+        "enabled": True,
+        "levels": ["公开", "内部", "秘密", "机密"],
+        "data_default": "内部",
+        "report_hidden": True,
+    },
+    "plants": {
+        "enabled": False,
+        "names": ["一厂", "二厂"],
+        "data_default": "一厂",
+    },
+    "llm": {
+        "enabled": False,
+        "base_url": "",
+        "model": "",
+        "api_key_env": "LISA_LLM_API_KEY",
+        "timeout_seconds": 25,
+        "max_steps": 8,
+        "temperature": 0.2,
+        "internal_only": True,
+        "internal_suffixes": [".intra", ".internal", ".lan", ".corp", ".local"],
+        "redact_fields": ["customer", "product_name", "supplier", "person_name", "drawing_no"],
+        "max_observation_chars": 1600,
+    },
 }
 
 SCENARIO_META = {

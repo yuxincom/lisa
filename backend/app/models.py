@@ -31,6 +31,7 @@ class User(Base):
     name = Column(String(64), nullable=False)
     role = Column(String(32), nullable=False)
     clearance = Column(String(16), default="内部")
+    plants = Column(JSON, default=list)
     department = Column(String(64), default="生产运营部")
     avatar_color = Column(String(16), default="#4f9dff")
     active = Column(Boolean, default=True)
@@ -57,6 +58,8 @@ class Resource(Base):
     domain = Column(String(32), nullable=False, index=True)
     plant = Column(String(16), default="一厂")
     capacity_hours = Column(Float, default=20.0)
+    machine_count = Column(Integer, default=1)
+    capabilities = Column(JSON, default=list)
     efficiency = Column(Float, default=0.92)
     bottleneck = Column(Boolean, default=False)
     status = Column(String(24), default="running")
@@ -78,6 +81,7 @@ class Order(Base):
     status = Column(String(24), default="已排产", index=True)
     progress = Column(Integer, default=0)
     is_military = Column(Boolean, default=True)
+    clearance = Column(String(16), default="内部", index=True)
     kit_status = Column(String(16), default="齐套")
     created_at = Column(DateTime, default=now)
     released_at = Column(DateTime, default=now)
@@ -104,6 +108,8 @@ class Operation(Base):
     locked = Column(Boolean, default=False)
     risk = Column(String(16), default="normal")
     valid_until = Column(DateTime, nullable=True)
+    predecessor_id = Column(Integer, ForeignKey("operations.id"), nullable=True)
+    lag_minutes = Column(Float, default=0.0)
 
 
 Index("ix_operations_order_seq", Operation.order_id, Operation.seq)
@@ -153,6 +159,7 @@ class PlanItem(Base):
     end = Column(DateTime, nullable=False)
     duration_minutes = Column(Float, default=60.0)
     setup_minutes = Column(Float, default=0.0)
+    transfer_minutes = Column(Integer, default=0)
     risk = Column(String(16), default="normal")
     locked = Column(Boolean, default=False)
     reason = Column(Text, default="")
@@ -194,6 +201,7 @@ class Disturbance(Base):
     options = Column(JSON, default=dict)
     resolved_at = Column(DateTime, nullable=True)
     reporter = Column(String(64), default="系统事件总线")
+    clearance = Column(String(16), default="内部", index=True)
 
 
 class KitCheck(Base):
@@ -335,3 +343,130 @@ class Setting(Base):
     key = Column(String(64), unique=True, nullable=False)
     value = Column(JSON, default=dict)
     updated_at = Column(DateTime, default=now)
+
+
+class Material(Base):
+    """ERP BOM 展开后的物料需求（齐套的需求侧）。"""
+
+    __tablename__ = "materials"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(64), unique=True, nullable=False, index=True)
+    name = Column(String(128), default="")
+    unit = Column(String(16), default="件")
+    category = Column(String(24), default="main_material")  # main_material / aux_material
+    product_code = Column(String(64), default="", index=True)  # 归属产品（products.code）
+    qty_per = Column(Float, default=1.0)  # 单台用量
+    lead_time_days = Column(Float, default=0.0)
+    source_system = Column(String(32), default="ERP")
+    updated_at = Column(DateTime, default=now)
+
+
+class StockItem(Base):
+    """WMS 库存快照（齐套的供给侧）。"""
+
+    __tablename__ = "stock_items"
+
+    id = Column(Integer, primary_key=True)
+    material_code = Column(String(64), unique=True, nullable=False, index=True)
+    on_hand = Column(Float, default=0.0)
+    allocated = Column(Float, default=0.0)
+    quality_status = Column(String(16), default="合格")  # 合格 / 待判 / 隔离
+    batch = Column(String(64), default="")
+    location = Column(String(64), default="")
+    source_system = Column(String(32), default="WMS")
+    updated_at = Column(DateTime, default=now)
+
+    @property
+    def available(self) -> float:
+        return max(0.0, float(self.on_hand or 0.0) - float(self.allocated or 0.0))
+
+
+class Inbound(Base):
+    """在途/采购到货承诺：ETA 早于需求的时点才算供给。"""
+
+    __tablename__ = "inbounds"
+
+    id = Column(Integer, primary_key=True)
+    reference = Column(String(64), default="", index=True)  # 采购单/送货单号，作为自然键
+    material_code = Column(String(64), default="", index=True)
+    qty = Column(Float, default=0.0)
+    eta = Column(DateTime, nullable=True)
+    supplier = Column(String(128), default="")
+    status = Column(String(16), default="在途")  # 在途 / 已到料 / 延期
+    updated_at = Column(DateTime, default=now)
+
+
+class Tool(Base):
+    """工装/刀具台账（kind 区分两类要素）。"""
+
+    __tablename__ = "tools"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(64), unique=True, nullable=False, index=True)
+    name = Column(String(128), default="")
+    kind = Column(String(16), default="tooling")  # tooling / cutter
+    domain = Column(String(32), default="", index=True)  # 对应资源能力域
+    status = Column(String(16), default="可用")  # 可用 / 检修 / 未归位
+    life_remaining = Column(Float, nullable=True)  # 刀具剩余寿命百分比
+    owner = Column(String(64), default="")
+    updated_at = Column(DateTime, default=now)
+
+
+class Qualification(Base):
+    """HR 技能矩阵（配置清单 C4）：有数据后 HC-10 才真正参与校验。"""
+
+    __tablename__ = "qualifications"
+
+    id = Column(Integer, primary_key=True)
+    person_name = Column(String(64), nullable=False)
+    capability = Column(String(32), default="", index=True)  # 对应 resource_type / 能力域
+    certificate = Column(String(64), default="")
+    level = Column(Integer, default=1)
+    valid_until = Column(DateTime, nullable=True)
+    active = Column(Boolean, default=True)
+    updated_at = Column(DateTime, default=now)
+
+
+class Inspection(Base):
+    """QMS 检验结论：上道工序未判定或不合格即阻断开工。"""
+
+    __tablename__ = "inspections"
+
+    id = Column(Integer, primary_key=True)
+    order_no = Column(String(32), nullable=False, index=True)
+    seq = Column(Integer, default=1)
+    conclusion = Column(String(16), default="合格")  # 合格 / 待判 / 不合格
+    inspector = Column(String(64), default="")
+    detail = Column(JSON, default=dict)
+    checked_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now)
+
+
+class Job(Base):
+    """后台任务队列的持久化行。
+
+    状态只走 queued → running → succeeded/failed（+ cancelled）；
+    queued 行落在库里意味着「重启后仍未做的事」，worker 起来会接着claim，
+    不像进程内队列那样一掉电就丢任务。
+    """
+
+    __tablename__ = "jobs"
+
+    id = Column(Integer, primary_key=True)
+    kind = Column(String(48), nullable=False, index=True)
+    status = Column(String(16), default="queued", index=True)
+    payload = Column(JSON, default=dict)
+    result = Column(JSON, default=dict)
+    error = Column(JSON, default=dict)
+    progress = Column(Integer, default=0)
+    attempt = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=1)
+    worker = Column(String(64), default="")
+    created_by = Column(String(64), default="")
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    clearance = Column(String(16), default="内部")
+    queued_at = Column(DateTime, default=now)
+    started_at = Column(DateTime, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)

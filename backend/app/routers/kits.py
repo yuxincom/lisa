@@ -4,18 +4,44 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..deps import require
+from ..deps import clearance_cfg, plant_cfg, require
 from ..models import KitCheck, Order, User
 from ..schemas import KitCheckRequest
+from ..services import clearance as clr
+from ..services import plants as pl
 from ..services.audit import log_user_action
 from ..services.kits import CHECKPOINT_LABELS, kit_overview, persist_check, serialize_check
 
 router = APIRouter(prefix="/api/kits", tags=["kits"])
 
 
+def _denied(db: Session, user: User, order: Order) -> None:
+    cfg, pcfg = clearance_cfg(db), plant_cfg(db)
+    if clr.can_read(user, order, cfg) and pl.can_read(user, order, pcfg):
+        return
+    by_plant = clr.can_read(user, order, cfg)
+    log_user_action(
+        db, user, "plant.denied" if by_plant else "clearance.denied", "order", order.order_no, result="denied",
+        detail={"required": order.plant if by_plant else order.clearance, "surface": "kits"},
+    )
+    db.commit()
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            {"code": "PLANT_DENIED", "message": f"{user.username} 的厂区范围不含工单 {order.order_no} 所在的 {order.plant}"}
+            if by_plant
+            else {"code": "CLEARANCE_DENIED", "message": f"{user.username} 的密级不足以查看工单 {order.order_no}"}
+        ),
+    )
+
+
 @router.get("/overview")
 def overview(db: Session = Depends(get_db), user: User = Depends(require("kits:read"))):
-    return kit_overview(db)
+    cfg, pcfg = clearance_cfg(db), plant_cfg(db)
+    result = kit_overview(db, pl.visible_order_ids(user, cfg, pcfg))
+    result["hidden_orders_by_clearance"] = clr.hidden_count(db, Order, user, cfg)
+    result["hidden_orders_by_plant"] = pl.hidden_count(db, Order, user, pcfg)
+    return result
 
 
 @router.get("")
@@ -27,7 +53,11 @@ def list_checks(
     db: Session = Depends(get_db),
     user: User = Depends(require("kits:read")),
 ):
+    cfg, pcfg = clearance_cfg(db), plant_cfg(db)
     query = db.query(KitCheck).filter(KitCheck.checkpoint == checkpoint)
+    scope = pl.visible_order_ids(user, cfg, pcfg)
+    if scope is not None:
+        query = query.filter(KitCheck.order_id.in_(scope))
     if status:
         query = query.filter(KitCheck.status == status)
     if search:
@@ -43,6 +73,7 @@ def list_checks(
         "齐套": sum(1 for c in items if c["status"] == "齐套"),
         "缺项": sum(1 for c in items if c["status"] == "缺项"),
         "阻断": sum(1 for c in items if c["status"] == "阻断"),
+        "待接入": sum(1 for c in items if c["status"] == "待接入"),
     }
     return {
         "items": items,
@@ -50,6 +81,8 @@ def list_checks(
         "checkpoint_label": CHECKPOINT_LABELS.get(checkpoint, checkpoint),
         "counts": counts,
         "total": len(items),
+        "hidden_orders_by_clearance": clr.hidden_count(db, Order, user, cfg),
+        "hidden_orders_by_plant": pl.hidden_count(db, Order, user, pcfg),
     }
 
 
@@ -62,6 +95,7 @@ def run_check(
     order = db.get(Order, payload.order_id)
     if not order:
         raise HTTPException(status_code=404, detail={"code": "ORDER_NOT_FOUND", "message": "订单不存在"})
+    _denied(db, user, order)
     if payload.checkpoint not in CHECKPOINT_LABELS:
         raise HTTPException(status_code=400, detail={"code": "CHECKPOINT_INVALID", "message": "检查时点非法"})
     check = persist_check(db, order, payload.checkpoint)
@@ -79,6 +113,8 @@ def order_kits(order_id: int, db: Session = Depends(get_db), user: User = Depend
     order = db.get(Order, order_id)
     if not order:
         raise HTTPException(status_code=404, detail={"code": "ORDER_NOT_FOUND", "message": "订单不存在"})
+    cfg = clearance_cfg(db)
+    _denied(db, user, order)
     checks = (
         db.query(KitCheck)
         .filter(KitCheck.order_id == order_id)
@@ -97,6 +133,7 @@ def order_kits(order_id: int, db: Session = Depends(get_db), user: User = Depend
             "priority": order.priority,
             "kit_status": order.kit_status,
             "due_date": order.due_date.isoformat(),
+            "clearance": order.clearance or cfg["data_default"],
         },
         "checkpoints": [serialize_check(latest[cp]) for cp in CHECKPOINT_LABELS if cp in latest],
     }

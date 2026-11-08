@@ -60,26 +60,27 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
     "commander": [
         "dashboard:read", "plans:read", "plans:approve", "agents:read", "agents:run",
         "changes:read", "changes:approve", "kits:read", "data:read", "knowledge:read",
-        "audit:read", "alerts:read", "alerts:ack", "settings:read", "export:read",
+        "audit:read", "audit:anchor", "alerts:read", "alerts:ack", "settings:read", "export:read",
+        "jobs:read", "jobs:cancel",
     ],
     "planner": [
         "dashboard:read", "plans:read", "plans:create", "plans:submit", "plans:approve",
         "agents:read", "agents:run", "changes:read", "changes:create", "changes:approve",
         "kits:read", "data:read", "knowledge:read", "audit:read", "alerts:read",
-        "alerts:ack", "settings:read", "export:read",
+        "alerts:ack", "settings:read", "export:read", "jobs:read", "jobs:cancel",
     ],
     "dispatcher": [
         "dashboard:read", "plans:read", "agents:read", "agents:run", "changes:read",
         "changes:create", "kits:read", "data:read", "knowledge:read", "alerts:read",
-        "alerts:ack",
+        "alerts:ack", "jobs:read",
     ],
     "engineer": [
         "dashboard:read", "plans:read", "agents:read", "changes:read", "kits:read",
-        "data:read", "knowledge:read", "alerts:read",
+        "data:read", "knowledge:read", "alerts:read", "jobs:read",
     ],
     "expert": [
         "dashboard:read", "plans:read", "agents:read", "agents:run", "changes:read",
-        "kits:read", "data:read", "knowledge:read", "audit:read", "alerts:read",
+        "kits:read", "data:read", "knowledge:read", "audit:read", "alerts:read", "jobs:read",
     ],
 }
 

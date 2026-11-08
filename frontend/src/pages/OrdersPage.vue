@@ -8,6 +8,7 @@ import type { Order, OrderDetail } from '@/types'
 import { DOMAIN_COLOR, formatDate, formatDateTime, formatNumber, formatTime } from '@/utils/format'
 import PageHeader from '@/components/PageHeader.vue'
 import AppIcon from '@/components/AppIcon.vue'
+import ClearanceBadge from '@/components/ClearanceBadge.vue'
 import PriorityTag from '@/components/PriorityTag.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import BaseDrawer from '@/components/BaseDrawer.vue'
@@ -18,6 +19,14 @@ interface OrderSummary {
   by_priority: { priority: string; count: number }[]
   military: number
   kit_risk: number
+  hidden_by_clearance?: number
+  hidden_by_level?: Record<string, number>
+  clearance_levels?: string[]
+  clearance_enabled?: boolean
+  hidden_by_plant?: Record<string, number>
+  plants?: string[]
+  plants_enabled?: boolean
+  your_plants?: string[] | null
 }
 
 const STATUSES = ['待排产', '已排产', '执行中', '逾期', '已完工', '冻结']
@@ -41,6 +50,7 @@ const loading = ref(false)
 const error = ref('')
 const statusFilter = ref('')
 const priorityFilter = ref('')
+const plantFilter = ref('')
 const search = ref('')
 let searchTimer: number | undefined
 
@@ -53,6 +63,21 @@ const countOf = (status: string) => summary.value?.by_status.find((row) => row.s
 const activityCount = computed(() => countOf('执行中') + countOf('已排产'))
 const progressTone = (value: number) => (value >= 80 ? 'var(--success)' : value >= 40 ? 'var(--accent)' : 'var(--blue)')
 const kitTone = (status: string) => (status === '齐套' ? 'success' : 'danger')
+
+const hiddenTotal = computed(() => (summary.value?.hidden_by_clearance ?? 0) + hiddenByPlantTotal.value)
+const hiddenByPlantTotal = computed(() => Object.values(summary.value?.hidden_by_plant || {}).reduce((sum, n) => sum + n, 0))
+const plantOptions = computed(() => summary.value?.your_plants || summary.value?.plants || [])
+const hiddenPlantDetail = computed(() => {
+  const parts = Object.entries(summary.value?.hidden_by_plant || {}).filter(([, count]) => count > 0).map(([name, count]) => `${name} ${count}`)
+  return parts.join(' · ')
+})
+const hiddenDetail = computed(() => {
+  const levels = summary.value?.hidden_by_level || {}
+  const parts = Object.entries(levels)
+    .filter(([, count]) => count > 0)
+    .map(([level, count]) => `${level} ${count}`)
+  return parts.length ? parts.join(' · ') : ''
+})
 
 async function loadSummary() {
   try {
@@ -69,6 +94,7 @@ async function loadOrders() {
     const res = await ordersApi.list({
       status: statusFilter.value || undefined,
       priority: priorityFilter.value || undefined,
+      plant: plantFilter.value || undefined,
       search: search.value.trim() || undefined,
       limit: 200,
     })
@@ -146,6 +172,8 @@ function applyQuery() {
   }
 }
 
+watch(plantFilter, loadOrders)
+
 watch(
   () => route.query.order,
   (value) => {
@@ -187,8 +215,21 @@ onMounted(async () => {
         <span>军品 {{ summary?.military ?? '—' }} 张</span>
         <span class="meta-dot" />
         <span>齐套风险 <strong class="text-danger">{{ summary?.kit_risk ?? '—' }}</strong></span>
+        <template v-if="hiddenTotal > 0">
+          <span class="meta-dot" />
+          <span class="meta-hidden">{{ hiddenTotal }} 张因读取范围未显示</span>
+        </template>
       </template>
     </PageHeader>
+
+    <div v-if="hiddenTotal > 0" class="clearance-note">
+      <AppIcon name="lock" :size="14" />
+      <span>
+        另有 <strong class="num">{{ hiddenTotal }}</strong> 张订单不在你的可读范围里（密级 {{ summary?.hidden_by_clearance ?? 0 }} 张、
+        厂区 {{ hiddenByPlantTotal }} 张），本页所有统计与列表都不包含它们——看不见不等于不存在。
+        {{ hiddenDetail ? `密级构成：${hiddenDetail}。` : '' }}{{ hiddenPlantDetail ? `厂区构成：${hiddenPlantDetail}。` : '' }}
+      </span>
+    </div>
 
     <div class="order-stats">
       <div class="stat panel">
@@ -230,6 +271,10 @@ onMounted(async () => {
           </button>
         </div>
         <div class="toolbar">
+          <select v-if="summary?.plants_enabled && plantOptions.length > 1" v-model="plantFilter" class="select select-sm">
+            <option value="">全部厂区</option>
+            <option v-for="name in plantOptions" :key="name" :value="name">{{ name }}</option>
+          </select>
           <div class="priority-chips">
             <button
               v-for="item in summary?.by_priority || []"
@@ -278,11 +323,13 @@ onMounted(async () => {
             <span class="order-meta">
               {{ order.customer }} · {{ order.plant }} · 数量 {{ order.qty }}
               <span v-if="order.is_military" class="badge badge-accent">军品</span>
+              <ClearanceBadge :level="order.clearance" />
             </span>
             <span class="order-mobile-tags only-mobile">
               <StatusBadge :status="order.status" :tone="STATUS_TONE[order.status]" />
               <span class="badge badge-muted">交期 {{ formatDate(order.due_date) }}</span>
               <span class="badge" :class="`badge-${kitTone(order.kit_status)}`">{{ order.kit_status }}</span>
+              <ClearanceBadge :level="order.clearance" />
               <span v-if="(order.late_hours || 0) > 0" class="badge badge-danger">逾期 {{ order.late_hours }}h</span>
             </span>
           </div>
@@ -343,6 +390,7 @@ onMounted(async () => {
                 <span class="dot" />齐套 {{ detail.order.kit_status }}
               </span>
               <span v-if="detail.order.is_military" class="badge badge-accent">军品保供</span>
+              <ClearanceBadge :level="detail.order.clearance" show-label />
             </div>
             <span class="hero-progress num">{{ detail.order.progress }}%</span>
           </div>

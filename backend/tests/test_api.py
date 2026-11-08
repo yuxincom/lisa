@@ -79,13 +79,12 @@ def test_plan_approval_signature_and_write_shield(client, planner):
     assert baseline.json()["id"] == plan["id"]
 
 
-def test_agent_full_run(client, planner):
-    response = client.post("/api/agents/run", headers=planner, json={"scenario": "full", "options": {}})
-    assert response.status_code == 200, response.text
-    run = response.json()
+def test_agent_full_run(client, planner, run_agent):
+    run = run_agent(planner, "full")
     assert run["status"] == "succeeded"
     assert run["agent_code"]
     assert run["steps"]
+    assert run["plans"], "run 详情必须带上本次产出的方案，否则抽屉里点不进方案"
 
     catalog = client.get("/api/agents/catalog", headers=planner)
     assert catalog.status_code == 200
@@ -236,3 +235,73 @@ def test_spa_static_serving(client):
     response = client.get("/")
     assert response.status_code == 200
     assert "LISA" in response.text
+
+
+def test_machine_ledger_import_is_admin_only_and_idempotent(client, admin, planner):
+    url = "/api/system/main-data/machine-ledger"
+    forbidden = client.post(url, headers=planner, json={"items": [{"code": "MC-01", "machine_count": 3}]})
+    assert forbidden.status_code == 403
+    assert forbidden.json()["detail"]["code"] == "ABAC_DENIED"
+
+    invalid = client.post(url, headers=admin, json={"items": [{"code": "MC-01", "machine_count": 0}]})
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"]["code"] == "LEDGER_ROW_INVALID"
+
+    ghost = client.post(url, headers=admin, json={"items": [{"code": "GHOST-99", "machine_count": 2}]})
+    assert ghost.status_code == 200
+    assert ghost.json()["unknown_codes"] == ["GHOST-99"]
+
+    items = [{"code": "MC-01", "machine_count": 3, "capabilities": ["机加"], "bottleneck": "是"}]
+    applied = client.post(url, headers=admin, json={"items": items})
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["updated"] == 1
+    assert applied.json()["multi_lane_resources"] >= 1
+
+    again = client.post(url, headers=admin, json={"items": items})
+    assert again.json()["updated"] == 0
+    assert again.json()["unchanged"] == 1
+
+
+def test_kit_data_ingest_endpoints_are_admin_only(client, admin, planner):
+    url = "/api/system/main-data/kit-data"
+    forbidden = client.post(url, headers=planner, json={"kind": "stock", "items": [{"material_code": "MT-X", "on_hand": 1}]})
+    assert forbidden.status_code == 403
+    assert forbidden.json()["detail"]["code"] == "ABAC_DENIED"
+
+    invalid = client.post(url, headers=admin, json={"kind": "stock", "items": [{"material_code": "MT-X", "on_hand": -3}]})
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"]["code"] == "KIT_ROW_INVALID"
+
+    unknown_kind = client.post(url, headers=admin, json={"kind": "nope", "items": [{"a": 1}]})
+    assert unknown_kind.status_code == 422
+    assert unknown_kind.json()["detail"]["code"] == "KIT_KIND_UNKNOWN"
+
+    dry = client.post(
+        url, headers=admin,
+        json={"kind": "stock", "items": [{"material_code": "MT-DRYRUN", "on_hand": 5, "allocated": 0}], "dry_run": True},
+    )
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["dry_run"] is True
+    sources = client.get("/api/system/main-data/kit-sources", headers=admin).json()
+    assert sources["stock"]["rows"] > 0
+    assert sources["stock"]["as_of"]
+
+    applied = client.post(
+        url, headers=admin,
+        json={"kind": "stock", "items": [{"material_code": "MT-DRYRUN", "on_hand": 5, "allocated": 0}]},
+    )
+    assert applied.json()["created"] == 1
+    assert client.get("/api/system/main-data/kit-sources", headers=admin).json()["stock"]["rows"] == sources["stock"]["rows"] + 1
+
+
+def test_operation_dependency_import_flips_hc04(client, admin, planner):
+    url = "/api/system/main-data/operation-dependencies"
+    assert client.post(url, headers=planner, json={"items": []}).status_code == 403
+    result = client.post(
+        url, headers=admin,
+        json={"items": [{"order_no": "MO-2026-0021", "seq": 2, "predecessor_order_no": "MO-2026-0022", "predecessor_seq": 1}]},
+    )
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["dependency_rows"] == 1
+    assert body["missing_orders"] == []

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { dataApi } from '@/api'
+import { dataApi, systemApi } from '@/api'
 import { errorMessage } from '@/composables/useAsync'
+import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
-import type { CoverageResponse, DataSource, QualityResponse } from '@/types'
+import type { AdapterOverview, CoverageResponse, DataSource, KitSourceFreshness, QualityResponse } from '@/types'
 import { formatDateTime, formatNumber } from '@/utils/format'
 import PageHeader from '@/components/PageHeader.vue'
 import AppIcon from '@/components/AppIcon.vue'
@@ -12,17 +13,55 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import Sparkline from '@/components/Sparkline.vue'
 
 const ui = useUiStore()
+const auth = useAuthStore()
 
 const quality = ref<QualityResponse | null>(null)
 const coverage = ref<CoverageResponse | null>(null)
+const ingest = ref<AdapterOverview | null>(null)
 const loading = ref(false)
 const checking = ref(false)
+const syncing = ref(false)
 const error = ref('')
 const dimensionIndex = ref(0)
+
+const KIND_LABELS: Record<string, string> = {
+  materials: 'ERP BOM 物料需求',
+  stock: 'WMS 库存快照',
+  inbound: '在途 / 采购承诺',
+  tools: 'MES 工装与刀具',
+  qualifications: 'HR 技能矩阵',
+  inspections: 'QMS 检验结论',
+}
+const CHANNEL_LABELS: Record<string, string> = { file: '文件落地', http: 'HTTP 拉取', db: '中间库直连' }
 
 const activeDimension = computed(() => quality.value?.dimensions[dimensionIndex.value] || null)
 const gateTone = computed(() => (quality.value?.gate.passed ? 'var(--success)' : 'var(--danger)'))
 const sources = computed<DataSource[]>(() => quality.value?.sources || [])
+
+const freshnessRows = computed(() =>
+  Object.entries(ingest.value?.freshness || {}).map(([kind, value]) => ({
+    kind,
+    label: KIND_LABELS[kind] || kind,
+    ...(value as KitSourceFreshness),
+  })),
+)
+const channels = computed(() => ingest.value?.sources || [])
+const canManageIngest = computed(() => auth.isAdmin)
+
+function freshnessTone(row: KitSourceFreshness) {
+  if (!row.rows) return 'var(--text-3)'
+  if (row.age_hours === null) return 'var(--text-3)'
+  if (row.age_hours <= 4) return 'var(--success)'
+  if (row.age_hours <= 24) return 'var(--warning)'
+  return 'var(--danger)'
+}
+
+function ageLabel(row: KitSourceFreshness) {
+  if (!row.rows) return '未接入'
+  if (row.age_hours === null) return '—'
+  if (row.age_hours < 1) return `${Math.round(row.age_hours * 60)} 分钟前`
+  return `${row.age_hours.toFixed(1)} 小时前`
+}
 
 function scoreColor(score: number) {
   if (score >= 95) return 'var(--success)'
@@ -43,13 +82,34 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [q, c] = await Promise.all([dataApi.quality(), dataApi.coverage()])
+    const [q, c, ingestRes] = await Promise.all([dataApi.quality(), dataApi.coverage(), systemApi.adapters()])
     quality.value = q
     coverage.value = c
+    ingest.value = ingestRes
   } catch (err) {
     error.value = errorMessage(err)
   } finally {
     loading.value = false
+  }
+}
+
+async function runSync() {
+  syncing.value = true
+  try {
+    const result = await systemApi.runAdapters(true)
+    await load()
+    const failed = result.ran.filter((item) => item.error).length
+    if (!result.ran.length) {
+      ui.info('没有到点的接入通道', '请先在配置清单里登记外部源，或用 CLI 导入 CSV 模板')
+    } else if (failed) {
+      ui.error(`${failed} 个通道同步失败`, result.ran.find((item) => item.error)?.error?.message || '')
+    } else {
+      ui.success('外部主数据同步完成', `${result.ran.length} 个通道 · ${result.ran.reduce((sum, item) => sum + (item.rows || 0), 0)} 行`)
+    }
+  } catch (err) {
+    ui.error('同步失败', errorMessage(err))
+  } finally {
+    syncing.value = false
   }
 }
 
@@ -266,6 +326,80 @@ onMounted(load)
         </div>
       </section>
     </div>
+
+    <section class="panel ingest-panel">
+      <div class="panel-head">
+        <div class="panel-title"><span class="title-mark" />外部主数据接入（齐套九要素的供给侧）</div>
+        <button v-if="canManageIngest" class="btn btn-primary" type="button" :disabled="syncing" @click="runSync">
+          <span v-if="syncing" class="spinner" />
+          <AppIcon v-else name="refresh" :size="14" />
+          {{ syncing ? '同步中…' : '立即同步' }}
+        </button>
+      </div>
+      <div class="ingest-grid">
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>数据种类</th>
+                <th>源系统</th>
+                <th>行数</th>
+                <th>最近写入</th>
+                <th>时效</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in freshnessRows" :key="row.kind">
+                <td>
+                  <div class="source-cell">
+                    <span class="source-code mono">{{ row.kind }}</span>
+                    <span class="cell-strong">{{ row.label }}</span>
+                  </div>
+                </td>
+                <td>{{ row.rows ? formatDateTime(row.as_of) : '待接入' }}</td>
+                <td class="num">{{ formatNumber(row.rows) }}</td>
+                <td class="muted">{{ ageLabel(row) }}</td>
+                <td>
+                  <span class="freshness-dot" :style="{ background: freshnessTone(row) }" />
+                  <span :style="{ color: freshnessTone(row) }">{{ row.rows ? (row.age_hours !== null && row.age_hours > 24 ? '过期' : '新鲜') : '未接入' }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="ingest-channels">
+          <div v-if="!channels.length" class="channel-empty">
+            <AppIcon name="info" :size="14" />
+            <p>
+              还没有登记自动接入通道。三种方式任选：<strong>文件落地</strong>（源系统按 CSV 模板定时导出到共享目录）、
+              <strong>HTTP 拉取</strong>（内网 https 接口）、<strong>中间库直连</strong>（只读 SELECT 视图）。
+              配置口径见 <code>docs/投产配置清单.md</code> 的 D 组，模板在 <code>deploy/templates/</code>。
+            </p>
+            <p class="muted">也可以先手工导入：<code>python -m app.management kit-data stock ../deploy/templates/齐套-库存.csv</code></p>
+          </div>
+          <div v-for="channel in channels" :key="channel.name" class="channel" :class="{ failed: !!channel.error }">
+            <div class="channel-head">
+              <strong>{{ channel.name }}</strong>
+              <StatusBadge
+                :label="channel.error ? '异常' : channel.enabled ? '启用' : '停用'"
+                :tone="channel.error ? 'danger' : channel.enabled ? 'success' : 'muted'"
+              />
+            </div>
+            <div class="channel-meta">
+              <span>{{ CHANNEL_LABELS[channel.channel] || channel.channel }}</span>
+              <span>写入 {{ channel.kind }}</span>
+              <span>每 {{ channel.interval_minutes }} 分钟</span>
+              <span v-if="channel.rows !== null">{{ channel.rows }} 行</span>
+            </div>
+            <div class="channel-time">
+              <span v-if="channel.last_sync">上次 {{ formatDateTime(channel.last_sync) }}</span>
+              <span v-if="channel.next_sync">下次 {{ formatDateTime(channel.next_sync) }}</span>
+            </div>
+            <p v-if="channel.error" class="channel-error">{{ channel.error.code }} · {{ channel.error.message }}</p>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <div class="meta-grid">
       <section class="panel">
@@ -778,6 +912,114 @@ onMounted(load)
   font-family: var(--mono);
 }
 
+.ingest-panel {
+  margin-bottom: 16px;
+}
+
+.ingest-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px 18px 18px;
+}
+
+.ingest-channels {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-left: 1px solid var(--border);
+  padding-left: 16px;
+}
+
+.channel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-inset);
+}
+
+.channel.failed {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+.channel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.channel-head strong {
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.channel-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.channel-time {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.channel-error {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.channel-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 13px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--text-2);
+}
+
+.channel-empty svg {
+  color: var(--text-3);
+}
+
+.channel-empty strong {
+  color: var(--text);
+}
+
+.channel-empty code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+}
+
+.freshness-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  vertical-align: 1px;
+}
+
 @media (max-width: 1439px) {
   .dimension-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -807,6 +1049,15 @@ onMounted(load)
   .data-grid,
   .meta-grid {
     grid-template-columns: 1fr;
+  }
+  .ingest-grid {
+    grid-template-columns: 1fr;
+  }
+  .ingest-channels {
+    border-left: 0;
+    padding-left: 0;
+    border-top: 1px solid var(--border);
+    padding-top: 14px;
   }
   .meta-cards {
     grid-template-columns: repeat(3, minmax(0, 1fr));

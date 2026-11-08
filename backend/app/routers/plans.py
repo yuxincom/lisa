@@ -8,10 +8,12 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..deps import get_current_user, require
-from ..models import Alert, Approval, Disturbance, Order, Plan, PlanItem, Resource, User
+from ..deps import clearance_cfg, get_current_user, plant_cfg, require
+from ..models import Alert, Approval, Disturbance, Knowledge, Order, Plan, PlanItem, Resource, Rule, User
 from ..schemas import ApproveRequest, FeedbackRequest
 from ..security import signature_digest, verify_password
+from ..services import clearance as clr
+from ..services import plants as pl
 from ..services.audit import log_user_action
 from ..services.metrics import latest_baseline
 from ..services.rules import validate_schedule
@@ -39,6 +41,13 @@ def _plan_or_404(db: Session, plan_id: int) -> Plan:
     if not plan:
         raise HTTPException(status_code=404, detail={"code": "PLAN_NOT_FOUND", "message": "排产方案不存在"})
     return plan
+
+
+def _scope(db: Session, user: User) -> tuple[dict, object]:
+    """方案条目挂在工单上：工单密级高于读者、或厂区不在其范围内时，甘特条目与明细整条不出现。
+    返回 (密级配置, PlanItem.order_id 的可见子查询)，未启用过滤时子查询为 None。"""
+    cfg = clearance_cfg(db)
+    return cfg, pl.visible_order_ids(user, cfg, plant_cfg(db))
 
 
 @router.get("")
@@ -110,14 +119,21 @@ def get_plan(
     user: User = Depends(require("plans:read")),
 ):
     plan = _plan_or_404(db, plan_id)
+    cfg, order_scope = _scope(db, user)
     data = plan_to_dict(plan, db)
-    data["items_count"] = db.query(PlanItem).filter(PlanItem.plan_id == plan.id).count()
+    item_query = db.query(PlanItem).filter(PlanItem.plan_id == plan.id)
+    if order_scope is not None:
+        item_query = item_query.filter(PlanItem.order_id.in_(order_scope))
+    data["items_count"] = item_query.count()
+    data["hidden_items_by_clearance"] = (
+        db.query(PlanItem).filter(PlanItem.plan_id == plan.id).count() - data["items_count"]
+    )
     if include_items:
-        items = db.query(PlanItem).filter(PlanItem.plan_id == plan.id).order_by(PlanItem.start).limit(4000).all()
+        items = item_query.order_by(PlanItem.start).limit(4000).all()
         data["items"] = [item_to_dict(i) for i in items]
     if plan.change_id:
         change = db.get(Disturbance, plan.change_id)
-        data["change"] = change_to_dict(change) if change else None
+        data["change"] = change_to_dict(change, user, cfg) if change else None
     siblings = []
     if plan.batch_id:
         siblings = db.query(Plan).filter(Plan.batch_id == plan.batch_id, Plan.id != plan.id).all()
@@ -139,7 +155,10 @@ def plan_gantt(
     user: User = Depends(require("plans:read")),
 ):
     plan = _plan_or_404(db, plan_id)
+    _, order_scope = _scope(db, user)
     query = db.query(PlanItem).filter(PlanItem.plan_id == plan.id, PlanItem.domain == domain)
+    if order_scope is not None:
+        query = query.filter(PlanItem.order_id.in_(order_scope))
     if priority:
         query = query.filter(PlanItem.priority == priority)
     if search:
@@ -149,15 +168,14 @@ def plan_gantt(
     current_baseline = latest_baseline(db)
     baseline_items = []
     if current_baseline and current_baseline.id != plan.id:
-        baseline_items = (
-            db.query(PlanItem)
-            .filter(
-                PlanItem.plan_id == current_baseline.id,
-                PlanItem.domain == domain,
-                PlanItem.operation_id.in_([i.operation_id for i in items if i.operation_id]) if items else False,
-            )
-            .all()
+        baseline_query = db.query(PlanItem).filter(
+            PlanItem.plan_id == current_baseline.id,
+            PlanItem.domain == domain,
+            PlanItem.operation_id.in_([i.operation_id for i in items if i.operation_id]) if items else False,
         )
+        if order_scope is not None:
+            baseline_query = baseline_query.filter(PlanItem.order_id.in_(order_scope))
+        baseline_items = baseline_query.all()
     resources = db.query(Resource).filter(Resource.domain == domain).order_by(Resource.bottleneck.desc(), Resource.code).all()
     freeze_days = int(get_setting(db, "freeze_days", 3))
     now = datetime.now().replace(second=0, microsecond=0)
@@ -196,7 +214,10 @@ def plan_items(
     user: User = Depends(require("plans:read")),
 ):
     _plan_or_404(db, plan_id)
+    _, order_scope = _scope(db, user)
     query = db.query(PlanItem).filter(PlanItem.plan_id == plan_id)
+    if order_scope is not None:
+        query = query.filter(PlanItem.order_id.in_(order_scope))
     if domain:
         query = query.filter(PlanItem.domain == domain)
     if risk:
@@ -327,11 +348,17 @@ def plan_lineage(
     summary = plan.summary or {}
     hard_checks = summary.get("hard_checks", [])
     soft = summary.get("soft_violations", [])
+    rule_count = db.query(Rule).filter(Rule.kind == "rule").count()
+    hard_count = db.query(Rule).filter(Rule.kind == "hard").count()
+    soft_count = db.query(Rule).filter(Rule.kind == "soft").count()
+    spec_count = db.query(Knowledge).filter(Knowledge.category == "专识").count()
+    gen_count = db.query(Knowledge).filter(Knowledge.category != "专识").count()
     nodes = [
         {"id": "plan", "label": plan.code, "type": "plan", "meta": {"objective": plan.objective, "status": plan.status}},
-        {"id": "data", "label": "专识 68,884 条 / 通识 54,400 条", "type": "dataset", "meta": {"trace_version": "v1.0"}},
-        {"id": "rules", "label": "68 条排产规则", "type": "rule", "meta": {"version": "ZD-01-2026"}},
-        {"id": "constraints", "label": "HC-01~14 / SC-01~13", "type": "constraint", "meta": {"hard": 14, "soft": 13}},
+        {"id": "data", "label": f"专识 {spec_count} 条 / 通识 {gen_count} 条", "type": "dataset", "meta": {"trace_version": "v1.0"}},
+        {"id": "rules", "label": f"{rule_count} 条排产规则", "type": "rule", "meta": {"version": "ZD-01-2026"}},
+        {"id": "constraints", "label": f"硬约束 {hard_count} 条 / 软约束 {soft_count} 条", "type": "constraint",
+         "meta": {"hard": hard_count, "soft": soft_count}},
         {"id": "solver", "label": "LISA Heuristic Engine", "type": "solver", "meta": {"scenario": plan.scenario, "weights": plan.weights}},
         {"id": "approval", "label": "生产指挥部终审", "type": "approval", "meta": {"signature": (plan_to_dict(plan, db).get("approval") or {}).get("signature", "待签发")}},
     ]
@@ -358,7 +385,8 @@ def plan_lineage(
         "prov": {
             "bundle": f"PROV-O/{plan.code}",
             "hard_checks": len(hard_checks),
-            "hard_failed": sum(1 for c in hard_checks if not c.get("passed")),
+            "hard_failed": sum(1 for c in hard_checks if c.get("evaluated", True) and not c.get("passed")),
+            "hard_unevaluated": sum(1 for c in hard_checks if c.get("evaluated") is False),
             "soft_violations": len(soft),
             "trace_version": "v1.0",
         },

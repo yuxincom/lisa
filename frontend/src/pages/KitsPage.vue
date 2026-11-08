@@ -54,7 +54,21 @@ const totalMissing = computed(() =>
   overview.value?.by_checkpoint.reduce((sum, row) => sum + row.missing + row.blocked, 0) || 0,
 )
 const postRate = computed(() => overview.value?.post_schedule_rate || 0)
+const hiddenOrders = computed(() => overview.value?.hidden_orders_by_clearance ?? 0)
 const timerTone = computed(() => (postRate.value >= 85 ? 'var(--success)' : postRate.value >= 60 ? 'var(--warning)' : 'var(--danger)'))
+
+const drawerNote = computed(() => {
+  const check = detail.value
+  if (!check) return ''
+  const unknown = check.elements.filter((element) => element.status === 'unknown')
+  if (check.gaps.length) {
+    return '存在缺口，需按责任归口在时效内闭环，开工前关键缺口将硬阻断。'
+  }
+  if (unknown.length) {
+    return `${unknown.length} 项要素的外部源尚未接入（${unknown.map((element) => element.name).join('、')}），已按可判定要素计分，不宣布齐套。`
+  }
+  return '九要素全部实算通过，可进入排产与开工流程。'
+})
 
 const statusChips = computed(() => {
   const list = [
@@ -62,6 +76,7 @@ const statusChips = computed(() => {
     { key: '齐套', label: '齐套', count: counts.value['齐套'] || 0 },
     { key: '缺项', label: '缺项', count: counts.value['缺项'] || 0 },
     { key: '阻断', label: '阻断', count: counts.value['阻断'] || 0 },
+    { key: '待接入', label: '待接入', count: counts.value['待接入'] || 0 },
   ]
   return list
 })
@@ -115,7 +130,21 @@ function scoreColor(score: number) {
 }
 
 function elementTone(status: string) {
-  return status === 'ok' ? 'success' : 'danger'
+  if (status === 'ok') return 'success'
+  if (status === 'unknown') return 'muted'
+  return 'danger'
+}
+
+function elementLabel(status: string) {
+  if (status === 'ok') return '齐套'
+  if (status === 'unknown') return '未接入'
+  return '缺项'
+}
+
+function elementIcon(status: string) {
+  if (status === 'ok') return 'check'
+  if (status === 'unknown') return 'info'
+  return 'alert'
 }
 
 async function openDetail(check: KitCheck) {
@@ -205,8 +234,21 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
         <span>更新时间 {{ formatDateTime(overview?.updated_at) }}</span>
         <span class="meta-dot" />
         <span>排产后齐套率 <strong class="text-accent">{{ postRate }}%</strong></span>
+        <template v-if="hiddenOrders > 0">
+          <span class="meta-dot" />
+          <span class="meta-hidden">{{ hiddenOrders }} 张订单因密级未计入</span>
+        </template>
       </template>
     </PageHeader>
+
+    <div v-if="hiddenOrders > 0" class="clearance-note">
+      <AppIcon name="lock" :size="14" />
+      <span>
+        齐套率只统计你密级可见的 <strong class="num">{{ totalChecks }}</strong> 单；另有
+        <strong class="num">{{ hiddenOrders }}</strong> 张订单高于你的可读范围，它们的缺口不会出现在这里，也不参与齐套率——
+        这不是「没有缺口」，是「看不见」。
+      </span>
+    </div>
 
     <div class="kit-hero">
       <section class="panel rate-panel">
@@ -365,9 +407,7 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
               <span class="badge badge-muted">{{ detail.checkpoint_label }}</span>
               <span v-if="detail.gaps.some((gap) => gap.critical)" class="badge badge-danger">关键缺口</span>
             </div>
-            <p class="drawer-note">
-              {{ detail.gaps.length ? '存在缺口，需按责任归口在时效内闭环，开工前关键缺口将硬阻断。' : '九要素全部齐套，可进入排产与开工流程。' }}
-            </p>
+            <p class="drawer-note">{{ drawerNote }}</p>
             <div class="kv compact-kv">
               <span class="k">订单号</span>
               <span class="v mono">{{ detail.order_no }}</span>
@@ -383,14 +423,14 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
         <div class="element-grid">
           <div v-for="element in detail.elements" :key="element.key" class="element-card">
             <span class="element-icon" :class="elementTone(element.status)">
-              <AppIcon :name="element.status === 'ok' ? 'check' : 'alert'" :size="14" />
+              <AppIcon :name="elementIcon(element.status)" :size="14" />
             </span>
             <div class="element-copy">
               <strong>{{ element.name }}</strong>
-              <span class="element-source">{{ element.source }}</span>
+              <span class="element-source">{{ element.source }} · {{ element.value }}</span>
             </div>
             <span class="element-state" :class="elementTone(element.status)">
-              {{ element.status === 'ok' ? '齐套' : '缺项' }}
+              {{ elementLabel(element.status) }}
             </span>
           </div>
         </div>
@@ -863,6 +903,12 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
   background: var(--danger-soft);
 }
 
+.element-icon.muted {
+  color: var(--text-3);
+  background: var(--surface-2);
+  border: 1px dashed var(--border-2);
+}
+
 .element-copy {
   display: flex;
   flex-direction: column;
@@ -896,6 +942,10 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
 
 .element-state.danger {
   color: var(--danger);
+}
+
+.element-state.muted {
+  color: var(--text-3);
 }
 
 .gap-list {

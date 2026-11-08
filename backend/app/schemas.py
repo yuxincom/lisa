@@ -16,6 +16,14 @@ class RunScenarioRequest(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class LlmConfigUpdate(BaseModel):
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class LlmTestRequest(BaseModel):
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
 class ApproveRequest(BaseModel):
     plan_id: int
     action: str = Field(pattern="^(approve|reject)$")
@@ -42,6 +50,38 @@ class AcknowledgeRequest(BaseModel):
 
 class SettingsUpdate(BaseModel):
     values: dict[str, Any]
+
+
+class UserScopeUpdate(BaseModel):
+    plants: list[str] = Field(default_factory=list)
+    clearance: str = ""
+
+
+class MachineLedgerUpdate(BaseModel):
+    items: list[dict[str, Any]]
+
+
+class KitDataUpdate(BaseModel):
+    kind: str
+    items: list[dict[str, Any]]
+    dry_run: bool = False
+
+
+class KnowledgeImportUpdate(BaseModel):
+    items: list[dict[str, Any]]
+    dry_run: bool = False
+
+
+class AdapterRunRequest(BaseModel):
+    force: bool = False
+
+
+class BackupVerifyRequest(BaseModel):
+    name: str
+
+
+class AdapterConfigUpdate(BaseModel):
+    sources: list[dict[str, Any]]
 
 
 class PlanCreateRequest(BaseModel):

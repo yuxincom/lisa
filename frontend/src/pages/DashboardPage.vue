@@ -58,6 +58,15 @@ const kit = computed(() => data.value?.kit || null)
 const domainWorkload = computed(() => data.value?.domain_workload || [])
 const totalDomainHours = computed(() => domainWorkload.value.reduce((sum, item) => sum + item.hours, 0))
 const maxDomainHours = computed(() => Math.max(1, ...domainWorkload.value.map((item) => item.hours)))
+const hiddenOrders = computed(() => {
+  const levels = data.value?.clearance?.hidden_orders || {}
+  return Object.values(levels).reduce((sum, count) => sum + count, 0)
+})
+const hiddenBreakdown = computed(() => {
+  const levels = data.value?.clearance?.hidden_orders || {}
+  const parts = Object.entries(levels).filter(([, count]) => count > 0).map(([level, count]) => `${level} ${count} 张`)
+  return parts.length ? parts.join('、') : '按密级分档未汇总'
+})
 
 function remaining(minutes?: number | null): string {
   if (minutes === undefined || minutes === null) return '待计算'
@@ -305,6 +314,16 @@ async function ack(id: number) {
           </div>
         </div>
       </section>
+
+      <div v-if="hiddenOrders > 0" class="clearance-note">
+        <AppIcon name="lock" :size="14" />
+        <span>
+          当前身份的密级为 <strong>{{ data.clearance?.your_level || '未标注' }}</strong>，
+          驾驶舱所有卡片、齐套率与波动队列只基于可见工单计算；另有
+          <strong class="num">{{ hiddenOrders }}</strong> 张订单（{{ hiddenBreakdown }}）高于可读范围，
+          未计入且不视为不存在。
+        </span>
+      </div>
 
       <section class="grid grid-kpi kpi-grid">
         <StatCard v-for="kpi in data.kpis" :key="kpi.key" :kpi="kpi" />

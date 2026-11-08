@@ -5,6 +5,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from ..config import ROLE_LABELS
+from . import clearance
 from ..models import (
     AgentRun,
     Alert,
@@ -47,6 +48,7 @@ def user_to_dict(user: User) -> dict:
         "role": user.role,
         "role_label": ROLE_LABELS.get(user.role, user.role),
         "clearance": user.clearance,
+        "plants": [str(x) for x in (user.plants or []) if str(x).strip()],
         "department": user.department,
         "avatar_color": user.avatar_color,
     }
@@ -140,6 +142,7 @@ def order_to_dict(order: Order, extra: dict | None = None) -> dict:
         "status": order.status,
         "progress": order.progress,
         "is_military": order.is_military,
+        "clearance": order.clearance or "内部",
         "kit_status": order.kit_status,
         "created_at": iso(order.created_at),
         "released_at": iso(order.released_at),
@@ -186,7 +189,35 @@ def alert_to_dict(alert: Alert) -> dict:
     }
 
 
-def change_to_dict(change: Disturbance) -> dict:
+def _redact_impact(impact: dict, user: User | None, cfg: dict | None) -> tuple[dict, int]:
+    """影响面里高于读者密级的工单：明细与涟漪节点隐去，但总数照报——数量是聚合值，
+    不是身份；把总数也改掉会让用户以为「没影响」，那比遮挡更危险。"""
+    if user is None or not cfg or not cfg.get("enabled"):
+        return impact, 0
+    allowed = set(clearance.allowed_values(user, cfg))
+    rows = impact.get("affected_orders") or []
+    visible = [item for item in rows if (item.get("clearance") or cfg.get("data_default")) in allowed]
+    hidden_ids = {item.get("order_id") for item in rows if item not in visible}
+    redacted = len(rows) - len(visible)
+    if redacted == 0:
+        return impact, 0
+    result = dict(impact)
+    result["affected_orders"] = visible
+    graph = result.get("graph")
+    if isinstance(graph, dict):
+        nodes = [
+            n for n in (graph.get("nodes") or [])
+            if not (n.get("type") == "order" and str(n.get("id", "")).replace("order-", "") in {str(i) for i in hidden_ids})
+        ]
+        kept = {n["id"] for n in nodes}
+        edges = [e for e in (graph.get("edges") or []) if e.get("source") in kept and e.get("target") in kept]
+        result["graph"] = {**graph, "nodes": nodes, "edges": edges}
+    result["redacted_affected"] = redacted
+    return result, redacted
+
+
+def change_to_dict(change: Disturbance, user: User | None = None, cfg: dict | None = None) -> dict:
+    impact, redacted = _redact_impact(change.impact or {}, user, cfg)
     return {
         "id": change.id,
         "code": change.code,
@@ -197,10 +228,12 @@ def change_to_dict(change: Disturbance) -> dict:
         "status": change.status,
         "occurred_at": iso(change.occurred_at),
         "payload": change.payload or {},
-        "impact": change.impact or {},
+        "impact": impact,
         "options": change.options or {},
         "resolved_at": iso(change.resolved_at),
         "reporter": change.reporter,
+        "clearance": change.clearance or "内部",
+        "redacted_affected": redacted,
     }
 
 

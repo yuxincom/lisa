@@ -100,7 +100,10 @@ const detailWeights = computed(() => {
 
 const detailChecks = computed(() => detail.value?.summary?.hard_checks || [])
 const detailSoft = computed(() => detail.value?.summary?.soft_violations || [])
-const failingChecks = computed(() => detailChecks.value.filter((check) => !check.passed).length)
+const skippedChecks = computed(() => detailChecks.value.filter((check) => check.evaluated === false))
+const failingChecks = computed(
+  () => detailChecks.value.filter((check) => check.evaluated !== false && !check.passed).length,
+)
 
 const canApprove = computed(() => auth.can('plans:approve'))
 
@@ -543,7 +546,7 @@ onMounted(() => void load())
                 </li>
               </ol>
               <div class="solver-meta">
-                <div><span>求解器</span><strong>{{ detail.summary?.solver || 'LISA Heuristic Engine' }}</strong></div>
+                <div><span>求解器</span><strong>{{ detail.summary?.solver || 'LISA Heuristic Engine（贪心派工，无外部求解器）' }}</strong></div>
                 <div><span>算法</span><strong>{{ detail.summary?.algorithm || 'ε约束 + 字典序修复' }}</strong></div>
                 <div><span>生成智能体</span><strong>{{ detail.summary?.generated_by || 'C-01 全厂总控' }}</strong></div>
               </div>
@@ -553,16 +556,36 @@ onMounted(() => void load())
               <div class="section-title">
                 <AppIcon name="check" :size="14" /> 硬约束校验
                 <span class="badge" :class="failingChecks ? 'badge-danger' : 'badge-success'">
-                  {{ failingChecks ? `${failingChecks} 项失败` : `${detailChecks.length} 项全部通过` }}
+                  {{
+                    failingChecks
+                      ? `${failingChecks} 项失败`
+                      : `${detailChecks.length - skippedChecks.length} 项全部通过`
+                  }}
+                </span>
+                <span v-if="skippedChecks.length" class="badge badge-muted">
+                  {{ skippedChecks.length }} 项未校验
                 </span>
               </div>
               <div class="check-grid">
-                <div v-for="check in detailChecks" :key="check.code" class="check-cell" :class="{ failed: !check.passed }" :title="check.description">
+                <div
+                  v-for="check in detailChecks"
+                  :key="check.code"
+                  class="check-cell"
+                  :class="{ failed: check.evaluated !== false && !check.passed, skipped: check.evaluated === false }"
+                  :title="check.evaluated === false ? check.message : check.description || check.message"
+                >
                   <span class="check-code mono">{{ check.code }}</span>
                   <span class="check-title">{{ check.title }}</span>
-                  <AppIcon :name="check.passed ? 'check' : 'x'" :size="13" class="check-icon" />
+                  <AppIcon
+                    :name="check.evaluated === false ? 'info' : check.passed ? 'check' : 'x'"
+                    :size="13"
+                    class="check-icon"
+                  />
                 </div>
               </div>
+              <p v-if="skippedChecks.length" class="fs-12 muted check-note">
+                {{ skippedChecks.map((check) => `${check.code} ${check.title}：${check.message}`).join('；') }}
+              </p>
             </div>
 
             <div v-if="detailSoft.length" class="drawer-section">
@@ -1102,6 +1125,9 @@ onMounted(() => void load())
   font-size: 11px;
 }
 .check-cell.failed { border-color: color-mix(in srgb, var(--danger) 40%, transparent); background: var(--danger-soft); }
+.check-cell.skipped { border-style: dashed; opacity: 0.62; }
+.check-cell.skipped .check-icon { color: var(--text-muted); }
+.check-note { margin-top: 8px; }
 .check-code { font-size: 9.5px; color: var(--text-3); flex: none; }
 .check-title { flex: 1; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .check-icon { color: var(--success); flex: none; }

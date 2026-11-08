@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { agentsApi, changesApi } from '@/api'
+import { agentsApi, changesApi, jobsApi, mcpApi } from '@/api'
 import { errorMessage } from '@/composables/useAsync'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
-import type { Agent, AgentCatalog, AgentRun, Change } from '@/types'
+import type { Agent, AgentCatalog, AgentRun, Change, Job, LlmRunMeta, LlmStatus, McpCatalog, QueueHealth } from '@/types'
 import {
   AGENT_LEVEL_LABEL,
   DOMAINS,
@@ -57,6 +57,9 @@ const agentFilter = ref('')
 const scenarioFilter = ref('')
 const runDetail = ref<AgentRun | null>(null)
 const runDetailOpen = ref(false)
+const mcp = ref<McpCatalog | null>(null)
+const llm = ref<LlmStatus | null>(null)
+const showToolList = ref(false)
 
 const runOpen = ref(false)
 const runScenario = ref('night')
@@ -66,8 +69,12 @@ const runPlanScenario = ref('A')
 const running = ref(false)
 const runError = ref('')
 const openChanges = ref<Change[]>([])
+const activeJob = ref<Job | null>(null)
+const queue = ref<QueueHealth | null>(null)
+let pollTimer: number | null = null
 
 const canRun = computed(() => auth.can('agents:run'))
+const canCancelJob = computed(() => auth.can('jobs:cancel'))
 const levels = computed(() => [
   { level: '', label: '全部', count: catalog.value?.summary.total || 0 },
   ...(catalog.value?.levels || []),
@@ -101,9 +108,17 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [cat, runResponse] = await Promise.all([agentsApi.catalog(), agentsApi.runs({ limit: 60 })])
+    const [cat, runResponse, llmStatus, mcpCatalog] = await Promise.all([
+      agentsApi.catalog(),
+      agentsApi.runs({ limit: 60 }),
+      agentsApi.llm().catch(() => null),
+      mcpApi.tools().catch(() => null),
+    ])
     catalog.value = cat
     runs.value = runResponse.items
+    llm.value = llmStatus
+    mcp.value = mcpCatalog
+    void loadQueue()
   } catch (err) {
     error.value = errorMessage(err)
   } finally {
@@ -117,6 +132,8 @@ function filterByAgent(agent: Agent) {
 
 async function openRunModal() {
   runError.value = ''
+  activeJob.value = null
+  running.value = false
   runScenario.value = 'night'
   runChangeId.value = null
   runDomain.value = '机加'
@@ -149,18 +166,91 @@ async function startRun() {
       options.domain = runDomain.value
       options.scenario = runPlanScenario.value
     }
-    const result = await agentsApi.run(runScenario.value, runChangeId.value, options)
-    runOpen.value = false
-    ui.success('智能体编排完成', result.summary)
-    await load()
-    runDetail.value = result
-    runDetailOpen.value = true
+    const accepted = await agentsApi.run(runScenario.value, runChangeId.value, options)
+    activeJob.value = accepted.job
+    pollJob(accepted.job.id)
   } catch (err) {
     runError.value = errorMessage(err)
-  } finally {
     running.value = false
   }
 }
+
+function stopPolling() {
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+function pollJob(jobId: number) {
+  stopPolling()
+  pollTimer = window.setInterval(async () => {
+    let job: Job
+    try {
+      job = await jobsApi.get(jobId)
+    } catch (err) {
+      stopPolling()
+      running.value = false
+      runError.value = errorMessage(err)
+      return
+    }
+    activeJob.value = job
+    if (job.status === 'queued' || job.status === 'running') return
+    stopPolling()
+    running.value = false
+    if (job.status !== 'succeeded') {
+      runError.value = `${job.error.code || job.status} · ${job.error.message || '后台任务未成功结束'}`
+      void loadQueue()
+      return
+    }
+    const runId = Number(job.result.run_id)
+    activeJob.value = null
+    runOpen.value = false
+    await load()
+    if (runId) {
+      runDetail.value = await agentsApi.runDetail(runId)
+      runDetailOpen.value = true
+      ui.success('智能体编排完成', runDetail.value.summary)
+    }
+  }, 1200)
+}
+
+async function loadQueue() {
+  try {
+    queue.value = await jobsApi.health()
+  } catch {
+    queue.value = null
+  }
+}
+
+async function cancelJob() {
+  const job = activeJob.value
+  if (!job) return
+  try {
+    activeJob.value = await jobsApi.cancel(job.id)
+    stopPolling()
+    running.value = false
+    ui.info('任务已取消', '仅排队中的任务可取消，已在执行的重排会跑完')
+  } catch (err) {
+    runError.value = errorMessage(err)
+  }
+}
+
+function jobStatusText(job: Job | null): string {
+  if (!job) return ''
+  if (job.status === 'queued') return '排队中，等待后台 worker 领取'
+  if (job.status === 'running') return `执行中 ${job.progress}%`
+  if (job.status === 'succeeded') return '已完成'
+  return '失败'
+}
+
+const queueWarning = computed(() => {
+  if (!queue.value) return ''
+  if (!queue.value.worker_enabled) return '后台 worker 未启动（LISA_JOB_WORKER=0），任务会一直排在队列里'
+  if (queue.value.queued > 0 && !queue.value.worker_alive) return `有 ${queue.value.queued} 个任务在排队，但本进程 worker 未存活`
+  if (queue.value.silent_workers > 0) return `${queue.value.silent_workers} 个执行进程心跳失联，等待回收`
+  return ''
+})
 
 async function openRun(id: number) {
   runDetailOpen.value = true
@@ -179,6 +269,26 @@ function simulatedMinutes(run: AgentRun): number {
   return Math.round(run.duration_ms / 6000) / 10
 }
 
+const REASONING_LABEL: Record<string, string> = {
+  llm: '模型推理',
+  fallback: '降级·确定性',
+  deterministic: '确定性',
+}
+
+const llmEnabled = computed(() => Boolean(llm.value?.config.enabled))
+const detailMeta = computed(() => runLlmMeta(runDetail.value))
+
+function runLlmMeta(run: AgentRun | null | undefined): LlmRunMeta | null {
+  const meta = run?.output?.llm as unknown
+  return meta && typeof meta === 'object' ? (meta as LlmRunMeta) : null
+}
+
+function reasoningTone(kind?: string): string {
+  if (kind === 'llm') return 'accent'
+  if (kind === 'fallback') return 'warning'
+  return 'muted'
+}
+
 function phaseTone(phase: string): string {
   if (phase === '感知') return 'blue'
   if (phase === '推理' || phase === '归因') return 'violet'
@@ -193,6 +303,7 @@ function gotoPlan(planId: number) {
 }
 
 onMounted(() => void load())
+onBeforeUnmount(stopPolling)
 </script>
 
 <template>
@@ -340,6 +451,7 @@ onMounted(() => void load())
                   <th>摘要</th>
                   <th>操作人</th>
                   <th>开始时间</th>
+                  <th>推理</th>
                   <th>状态</th>
                   <th />
                 </tr>
@@ -355,11 +467,16 @@ onMounted(() => void load())
                   <td class="run-summary-cell">{{ run.summary }}</td>
                   <td>{{ run.operator }}</td>
                   <td>{{ formatDateTime(run.started_at) }}</td>
+                  <td>
+                    <span class="badge" :class="`badge-${reasoningTone(runLlmMeta(run)?.mode)}`">
+                      {{ runLlmMeta(run)?.mode === 'llm' ? '模型' : '确定性' }}
+                    </span>
+                  </td>
                   <td><StatusBadge :status="run.status" :label="run.status === 'succeeded' ? '成功' : run.status" /></td>
                   <td class="cell-actions"><button class="btn btn-sm" @click.stop="openRun(run.id)">ReAct</button></td>
                 </tr>
                 <tr v-if="!filteredRuns.length">
-                  <td colspan="8"><div class="empty">{{ loading ? '加载中…' : '暂无运行记录' }}</div></td>
+                  <td colspan="9"><div class="empty">{{ loading ? '加载中…' : '暂无运行记录' }}</div></td>
                 </tr>
               </tbody>
             </table>
@@ -397,6 +514,83 @@ onMounted(() => void load())
           <div class="safety-foot">
             <AppIcon name="lock" :size="13" />
             LLM 与求解器均无直写权限，所有写入尝试记录哈希审计链。
+          </div>
+        </div>
+      </div>
+
+      <div class="panel brain-panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="title-mark" />编排大脑 · 模型与工具面</div>
+          <span class="badge" :class="llmEnabled ? 'badge-accent' : 'badge-muted'">
+            {{ llmEnabled ? '内网模型' : '确定性编排' }}
+          </span>
+        </div>
+        <div class="panel-body">
+          <div class="brain-row">
+            <span>模型</span>
+            <strong>{{ llm?.config.model || '未配置' }}</strong>
+          </div>
+          <div class="brain-row">
+            <span>端点</span>
+            <strong class="mono truncate">{{ llm?.config.base_url || '—' }}</strong>
+          </div>
+          <div class="brain-row">
+            <span>凭据</span>
+            <strong :class="llm?.credential_present ? 'text-success' : 'text-warning'">
+              {{ llm?.credential_present ? `${llm.credential_source} 已就绪` : `${llm?.credential_source || 'LISA_LLM_API_KEY'} 未设置` }}
+            </strong>
+          </div>
+          <div class="brain-row">
+            <span>近 {{ llm?.runs.window || 20 }} 次运行</span>
+            <strong>模型 {{ llm?.runs.llm || 0 }} · 确定性 {{ llm?.runs.fallback || 0 }}</strong>
+          </div>
+          <p class="brain-note">
+            模型只负责推理与选择工具，每个数字都由 LISA 代码实算后回填；内网模型不可用时自动降级为确定性编排，排产链路不中断。密钥只写环境变量名，不落库、不进日志。
+          </p>
+          <button class="btn btn-sm btn-ghost" :disabled="!mcp" @click="showToolList = !showToolList">
+            <AppIcon name="terminal" :size="13" />
+            只读工具面 {{ mcp?.count ?? 0 }} 个{{ showToolList ? ' · 收起' : ' · 展开' }}
+          </button>
+          <div v-if="showToolList && mcp" class="tool-list">
+            <div class="tool-endpoint mono">{{ mcp.endpoint }} · JSON-RPC {{ mcp.protocol_version }}</div>
+            <div v-for="entry in mcp.tools" :key="entry.name" class="tool-item">
+              <code>{{ entry.name }}</code>
+              <p>{{ entry.description }}</p>
+            </div>
+          </div>
+          <div v-else-if="mcp" class="tool-count-line">
+            {{ mcp.server.name }} v{{ mcp.server.version }} · {{ mcp.read_only ? '全量只读' : '含写操作' }}
+          </div>
+        </div>
+      </div>
+
+      <div class="panel queue-panel">
+        <div class="panel-head">
+          <div class="panel-title"><span class="title-mark" />后台任务队列</div>
+          <span class="badge" :class="queue?.worker_alive ? 'badge-success' : queue?.worker_enabled ? 'badge-warning' : 'badge-muted'">
+            {{ queue?.worker_alive ? 'worker 存活' : queue?.worker_enabled ? 'worker 未存活' : 'worker 已关闭' }}
+          </span>
+        </div>
+        <div class="panel-body">
+          <div class="queue-grid">
+            <div><span>排队</span><strong class="num">{{ queue?.queued ?? 0 }}</strong></div>
+            <div><span>执行中</span><strong class="num">{{ queue?.running ?? 0 }}</strong></div>
+            <div>
+              <span>最久等待</span>
+              <strong class="num">{{ queue?.oldest_queued_seconds != null ? `${queue.oldest_queued_seconds}s` : '—' }}</strong>
+            </div>
+            <div><span>失联执行</span><strong class="num" :class="{ 'text-warning': (queue?.silent_workers ?? 0) > 0 }">{{ queue?.silent_workers ?? 0 }}</strong></div>
+          </div>
+          <p v-if="queueWarning" class="queue-warning"><AppIcon name="warning" :size="13" /> {{ queueWarning }}</p>
+          <p v-else class="queue-note">
+            重排跑在后台 worker 里，HTTP 请求只负责入队；任务状态、耗时与失败原因都留在库里，可在审计里追到发起人。
+          </p>
+          <div class="queue-kinds">
+            <span class="fs-12 muted">已登记任务类型</span>
+            <div class="flex gap-6 wrap">
+              <span v-for="kind in queue?.kinds || []" :key="kind" class="badge badge-blue mono">{{ kind }}</span>
+              <span v-if="!queue?.kinds?.length" class="badge badge-muted">无</span>
+            </div>
           </div>
         </div>
       </div>
@@ -464,14 +658,32 @@ onMounted(() => void load())
         </div>
 
         <div v-if="runError" class="run-error"><AppIcon name="warning" :size="14" /> {{ runError }}</div>
+
+        <div v-if="activeJob" class="run-queue">
+          <div class="rq-head">
+            <span class="spinner" />
+            <strong>任务 #{{ activeJob.id }}</strong>
+            <span class="mono">{{ activeJob.kind }}</span>
+            <em>{{ jobStatusText(activeJob) }}</em>
+          </div>
+          <div class="rq-bar"><span :style="{ width: `${Math.max(4, activeJob.progress)}%` }" /></div>
+          <p class="rq-note">
+            编排已交给后台 worker，关掉本页不影响执行；排队与执行过程都落在 jobs 表里，进程重启后未跑完的任务会被重新领取。
+          </p>
+        </div>
       </div>
 
       <template #footer>
-        <button class="btn btn-ghost" :disabled="running" @click="runOpen = false">取消</button>
+        <button v-if="running && activeJob?.status === 'queued' && canCancelJob" class="btn btn-ghost" @click="cancelJob">
+          取消排队
+        </button>
+        <button v-else class="btn btn-ghost" :disabled="running" @click="runOpen = false">
+          {{ running ? '执行中…' : '关闭' }}
+        </button>
         <button class="btn btn-primary" :disabled="running" @click="startRun">
           <span v-if="running" class="spinner" />
           <AppIcon v-else name="play" :size="15" />
-          {{ running ? '编排执行中…' : '启动编排' }}
+          {{ running ? (activeJob ? '已入队，等待 worker' : '提交中…') : '启动编排' }}
         </button>
       </template>
     </BaseModal>
@@ -503,6 +715,22 @@ onMounted(() => void load())
 
         <div class="rd-summary">{{ runDetail.summary }}</div>
 
+        <div v-if="detailMeta" class="rd-brain" :class="detailMeta.mode === 'llm' ? 'is-llm' : 'is-fallback'">
+          <div class="rb-head">
+            <AppIcon :name="detailMeta.mode === 'llm' ? 'agents' : 'shield'" :size="14" />
+            <strong>{{ detailMeta.mode === 'llm' ? '内网模型推理' : '确定性编排（模型未参与）' }}</strong>
+            <span class="rb-chip mono">{{ detailMeta.model || '—' }}</span>
+          </div>
+          <div class="rb-grid">
+            <div><span>调用次数</span><strong class="num">{{ detailMeta.calls }}</strong></div>
+            <div><span>输入 token</span><strong class="num">{{ detailMeta.prompt_tokens }}</strong></div>
+            <div><span>输出 token</span><strong class="num">{{ detailMeta.completion_tokens }}</strong></div>
+            <div><span>取数工具</span><strong class="num">{{ (runDetail.steps || []).filter((s) => s.tool).length }}</strong></div>
+          </div>
+          <p v-if="detailMeta.reason" class="rb-reason">{{ detailMeta.reason }}</p>
+          <p v-if="detailMeta.error" class="rb-error">{{ detailMeta.error.code }} · {{ detailMeta.error.message }}</p>
+        </div>
+
         <div class="rd-steps">
           <div v-for="step in runDetail.steps || []" :key="step.index" class="rd-step">
             <div class="step-rail">
@@ -512,11 +740,20 @@ onMounted(() => void load())
             <div class="step-body">
               <div class="step-top">
                 <span class="badge" :class="`badge-${phaseTone(step.phase)}`">{{ step.phase }}</span>
+                <span v-if="step.reasoning" class="badge" :class="`badge-${reasoningTone(step.reasoning)}`">
+                  {{ REASONING_LABEL[step.reasoning] || step.reasoning }}
+                </span>
                 <strong>{{ step.title }}</strong>
                 <span class="step-duration num">{{ (step.duration_ms / 1000).toFixed(1) }}s</span>
               </div>
               <p class="step-thought">{{ step.thought }}</p>
               <div class="step-action mono">{{ step.action }}</div>
+              <div v-if="step.tool" class="step-tool mono">
+                <AppIcon name="terminal" :size="11" />
+                <span>{{ step.tool.tool }}</span>
+                <em v-if="step.tool.error" class="text-warning">{{ step.tool.error }}</em>
+                <em v-else class="num">{{ step.tool.ms }}ms · {{ step.tool.chars }} 字实算数据</em>
+              </div>
               <div class="step-observation"><AppIcon name="eye" :size="12" /> {{ step.observation }}</div>
             </div>
           </div>
@@ -766,6 +1003,50 @@ onMounted(() => void load())
   line-height: 1.5;
 }
 
+/* 编排大脑：模型接入状态 + 只读工具面 */
+.brain-panel .panel-body { display: flex; flex-direction: column; gap: 9px; }
+.brain-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.brain-row strong { color: var(--text-1); font-weight: 600; }
+.brain-row .truncate {
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+.brain-note {
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: 7px;
+  background: var(--panel-inset);
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+.tool-endpoint {
+  font-size: 10px;
+  color: var(--text-3);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.tool-list { display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow: auto; }
+.tool-item code {
+  font-size: 10.5px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.tool-item p { margin: 3px 0 0; font-size: 10.5px; line-height: 1.55; color: var(--text-3); }
+.tool-count-line { font-size: 10px; color: var(--text-3); }
+
 /* run modal */
 .run-body { display: flex; flex-direction: column; gap: 14px; }
 .scenario-options {
@@ -821,6 +1102,50 @@ onMounted(() => void load())
   font-size: 11.5px;
 }
 
+/* 后台任务：入队后的进度条 */
+.run-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--accent-line);
+  background: var(--accent-soft);
+}
+.rq-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-1); }
+.rq-head .mono { font-size: 10.5px; color: var(--text-3); }
+.rq-head em { margin-left: auto; font-style: normal; font-size: 10.5px; color: var(--accent); }
+.rq-bar { height: 4px; border-radius: 99px; background: var(--panel-inset); overflow: hidden; }
+.rq-bar span { display: block; height: 100%; border-radius: 99px; background: var(--accent); transition: width 0.5s ease; }
+.rq-note { margin: 0; font-size: 10.5px; line-height: 1.55; color: var(--text-3); }
+
+/* 队列体检面板 */
+.queue-panel .panel-body { display: flex; flex-direction: column; gap: 10px; }
+.queue-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.queue-grid div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  background: var(--panel-inset);
+  border: 1px solid var(--border);
+}
+.queue-grid span { font-size: 9.5px; color: var(--text-3); }
+.queue-grid strong { font-size: 16px; }
+.queue-note, .queue-warning { margin: 0; font-size: 10.5px; line-height: 1.6; color: var(--text-3); }
+.queue-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.queue-kinds { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.wrap { flex-wrap: wrap; }
+
 /* run detail */
 .detail-loading { display: flex; align-items: center; justify-content: center; gap: 9px; padding: 50px 0; color: var(--text-3); font-size: 12px; }
 .run-detail-head { display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
@@ -842,6 +1167,34 @@ onMounted(() => void load())
   color: var(--text-2);
   line-height: 1.6;
 }
+.rd-brain {
+  margin: -4px 0 16px;
+  padding: 11px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--panel-inset);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.rd-brain.is-llm { border-color: var(--accent-line); }
+.rb-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-1); }
+.rb-head strong { font-weight: 650; }
+.rb-chip {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-3);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 7px;
+}
+.rb-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.rb-grid div { display: flex; flex-direction: column; gap: 2px; }
+.rb-grid span { font-size: 10px; color: var(--text-3); }
+.rb-grid strong { font-size: 13px; color: var(--text-1); }
+.rb-reason, .rb-error { margin: 0; font-size: 10.5px; line-height: 1.55; color: var(--text-3); }
+.rb-error { color: var(--warning); }
 .rd-steps { display: flex; flex-direction: column; }
 .rd-step { display: flex; gap: 11px; }
 .step-rail { display: flex; flex-direction: column; align-items: center; width: 24px; flex: none; }
@@ -886,6 +1239,18 @@ onMounted(() => void load())
   line-height: 1.5;
 }
 .step-observation :deep(svg) { flex: none; margin-top: 1px; }
+.step-tool {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 6px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  font-size: 10.5px;
+  color: var(--text-2);
+}
+.step-tool em { font-style: normal; margin-left: auto; color: var(--text-3); font-size: 10px; }
 .rd-plans { margin-top: 6px; }
 .rd-plan-list { display: flex; flex-direction: column; gap: 6px; }
 .rd-plan {

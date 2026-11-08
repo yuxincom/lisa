@@ -83,7 +83,7 @@ const filteredItems = computed(() => {
 const tabs = computed(() => [
   { key: 'rules' as Tab, label: '规则库', count: catalog.value?.summary.total ?? 0 },
   { key: 'items' as Tab, label: '专识条目', count: items.value.length },
-  { key: 'rag' as Tab, label: 'RAG 检索', count: ragResult.value?.hits ?? 0 },
+  { key: 'rag' as Tab, label: '本地检索', count: ragResult.value?.hits ?? 0 },
 ])
 
 function kindMeta(kind: string) {
@@ -160,7 +160,7 @@ onMounted(async () => {
         </button>
         <button class="btn btn-primary" type="button" @click="tab = 'rag'">
           <AppIcon name="spark" :size="15" />
-          RAG 检索
+          本地检索
         </button>
       </template>
       <template #meta>
@@ -341,9 +341,9 @@ onMounted(async () => {
     <template v-else>
       <section class="rag-panel panel">
         <div class="rag-hero">
-          <span class="rag-eyebrow">RETRIEVAL AUGMENTED GENERATION</span>
+          <span class="rag-eyebrow">LOCAL KEYWORD RETRIEVAL · 可溯源</span>
           <h2>用自然语言检索排产知识</h2>
-          <p>本地 RAG 检索，多词加权匹配规则与专识条目，所有结果携带 source_ref / trace_version，可回查原始依据。</p>
+          <p>本地检索，多词加权匹配规则与专识条目，不依赖外部向量服务；所有结果携带 source_ref / trace_version，可回查原始依据。</p>
           <div class="rag-search">
             <div class="search-box">
               <AppIcon name="search" :size="16" />

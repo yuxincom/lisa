@@ -29,7 +29,8 @@ from .models import (
 )
 from .security import hash_password
 from .services.audit import append_audit
-from .services.impact import assess_disturbance, create_change_plans
+from .services.impact import assess_disturbance, create_change_plans, relabel_disturbance_clearance
+from .services.kit_data import upsert_rows
 from .services.kits import persist_check
 from .services.rule_data import HARD_CONSTRAINTS, RULES, SOFT_CONSTRAINTS
 from .services.scheduler import generate_schedule, save_plan
@@ -124,6 +125,48 @@ RESOURCE_DEFS = [
     ("OH", "大修", "修复装配线-OH02", "二厂", 20, 0.86, False),
     ("OH", "大修", "探伤复检工位-OH03", "二厂", 18, 0.85, False),
 ]
+
+# 演示用的并行机位数（同一资源条目代表几个可并行工位/机台）。
+# 投产时这一列必须来自设备台账，见 docs/投产配置清单.md 的 A1/A2。
+MACHINE_COUNTS = {
+    "加热炉-01": 2,
+    "加热炉-02": 2,
+    "锻后冷却线": 2,
+    "数控车床-CK01": 2,
+    "数控车床-CK02": 2,
+    "精密磨床-MK01": 2,
+    "表面强化线-SP01": 2,
+    "无损探伤-NDT01": 2,
+    "无损探伤-NDT02": 2,
+    "清洗线-WS01": 2,
+    "钣金成形机-BJ01": 2,
+    "激光焊-LW01": 2,
+    "氩弧焊-TIG01": 3,
+    "部装线-AS01": 2,
+    "总装线-AS02": 3,
+    "管路装配工位-AS03": 4,
+    "台架准备工位-TBP01": 2,
+    "大修分解线-OH01": 2,
+    "修复装配线-OH02": 3,
+    "探伤复检工位-OH03": 2,
+}
+
+# 齐套外部主数据的演示源（投产时由 ERP BOM / WMS 库存 / MES 工装刀具 / HR 技能矩阵 / QMS 检验结论
+# 经导入通道或适配器写入，见 docs/投产配置清单.md 的 D 组）。
+MATERIAL_LIB = {
+    "高压涡轮叶片": (("DD99 单晶母合金", "kg", 6.5, 150), ("陶瓷型芯", "件", 24, 60)),
+    "低压涡轮盘": (("GH4169 真空自耗锭", "kg", 42, 120), ("耐热垫片", "件", 12, 30)),
+    "压气机机匣": (("Ti-6Al-4V 锻棒", "kg", 28, 90), ("密封环坯", "件", 18, 45)),
+    "燃烧室火焰筒": (("Inconaloy 625 薄板", "kg", 9.5, 110), ("钎焊箔", "件", 30, 40)),
+    "加力筒体": (("GH3536 板材", "kg", 16, 85), ("膨胀节组件", "件", 6, 50)),
+    "主轴组件": (("12CrNi4HA 锻件", "kg", 55, 100), ("保持架", "件", 8, 35)),
+    "传动齿轮箱": (("20CrMnTiH 锻环", "kg", 22, 75), ("油封", "件", 14, 25)),
+    "燃油喷嘴": (("不锈钢精密铸件", "件", 4, 60), ("雾化芯", "件", 10, 30)),
+    "密封环组件": (("镍基粉材", "kg", 3.2, 70), ("弹簧片", "件", 40, 20)),
+    "机匣前段": (("铝合金锻坯", "kg", 18, 55), ("紧固件组", "件", 60, 15)),
+    "涡轮导向器": (("K417 熔模铸件", "件", 12, 95), ("冷却套管", "件", 9, 40)),
+    "尾喷管组件": (("钛合金焊接板", "kg", 24, 80), ("调节连杆", "件", 16, 35)),
+}
 
 KNOWLEDGE_ITEMS = [
     ("T1-001", "通识", "冻结窗口定义", "周计划前 3 天为冻结窗口，锁定工单原则上不调整；任何调整必须经审批并留电子签名。", "T1 术语库", ["冻结窗口", "周滚动", "锁定期"]),
@@ -221,6 +264,88 @@ def _make_route(factor: float) -> list[dict]:
     return route
 
 
+def _seed_kit_sources(db, products, orders, resources, actor):
+    """齐套外部主数据的演示快照：BOM / 库存 / 在途 / 工装刀具 / 资质 / 检验结论。"""
+    materials = []
+    stock = []
+    inbound = []
+    for i, product in enumerate(products):
+        main, aux = MATERIAL_LIB.get(product.family, MATERIAL_LIB["高压涡轮叶片"])
+        order = orders[i] if i < len(orders) else None
+        qty = max(1, int(order.qty or 1)) if order else 1
+        due = order.due_date if order and order.due_date else NOW + timedelta(days=20)
+        for category, spec in (("main_material", main), ("aux_material", aux)):
+            name, unit, qty_per, lead = spec
+            code = f"MT-{product.code}-{'M' if category == 'main_material' else 'A'}"
+            needed = round(qty_per * qty, 3)
+            short = category == "main_material" and i % 4 == 1
+            if short:
+                on_hand, allocated = round(needed * 0.4, 3), 0.0
+            else:
+                on_hand, allocated = round(needed * 1.2 + 4, 3), round(needed * 0.1, 3)
+            materials.append({
+                "code": code, "name": name, "unit": unit, "category": category,
+                "product_code": product.code, "qty_per": qty_per, "lead_time_days": lead,
+            })
+            stock.append({
+                "material_code": code, "on_hand": on_hand, "allocated": allocated,
+                "quality_status": "合格", "batch": f"B{2026 + i % 3}-{i + 1:03d}",
+                "location": "一厂立体库" if i % 2 == 0 else "二厂立体库",
+            })
+            if short:
+                covers_due = i % 8 == 1
+                eta = due - timedelta(days=3) if covers_due else due + timedelta(days=90)
+                inbound.append({
+                    "reference": f"PO-2026-{i + 1:04d}", "material_code": code,
+                    "qty": round(needed - (on_hand - allocated), 3),
+                    "eta": eta.strftime("%Y-%m-%d %H:%M"),
+                    "supplier": "宝钛股份" if i % 2 == 0 else "西部超导", "status": "在途",
+                })
+    domains = sorted({r.domain for r in resources})
+    tools = []
+    for d in domains:
+        for k in (1, 2):
+            tools.append({"code": f"TZ-{d}-{k:02d}", "name": f"{d}定位工装 #{k}", "kind": "tooling",
+                          "domain": d, "status": "可用", "owner": "工装室"})
+        for k in (1, 2):
+            tools.append({"code": f"CT-{d}-{k:02d}", "name": f"{d}可转位铣刀 #{k}", "kind": "cutter",
+                          "domain": d, "status": "可用", "life_remaining": round(RNG.uniform(45, 96), 1),
+                          "owner": "工具室"})
+
+    persons = ["王", "李", "张", "刘", "陈", "赵", "孙", "周"]
+    qualifications = []
+    for idx, d in enumerate(domains):
+        for k in range(3):
+            qualifications.append({
+                "person_name": f"{persons[(idx * 3 + k) % len(persons)]}师傅", "capability": d,
+                "certificate": f"ZY-{idx + 1:02d}{k + 1}", "level": 2 + (k % 2),
+                "valid_until": (NOW + timedelta(days=240 - k * 30)).strftime("%Y-%m-%d"), "active": "是",
+            })
+
+    inspections = []
+    for i, order in enumerate(orders):
+        if order.status == "已完工":
+            continue
+        for seq in (1, 2, 3):
+            conclusion = "合格"
+            if i % 9 == 3 and seq == 2:
+                conclusion = "待判"
+            elif i % 17 == 5 and seq == 3:
+                conclusion = "不合格"
+            inspections.append({
+                "order_no": order.order_no, "seq": seq, "conclusion": conclusion,
+                "inspector": f"检验员{(i % 5) + 1:02d}",
+            })
+
+    for kind, rows in (
+        ("materials", materials), ("stock", stock), ("inbound", inbound),
+        ("tools", tools), ("qualifications", qualifications), ("inspections", inspections),
+    ):
+        if rows:
+            upsert_rows(db, kind, rows, actor)
+    db.flush()
+
+
 def seed_if_empty() -> dict:
     db: Session = SessionLocal()
     try:
@@ -234,6 +359,18 @@ def seed_if_empty() -> dict:
         raise
     finally:
         db.close()
+
+
+def _order_clearance(index: int, customer: str, product) -> str:
+    """演示数据的密级分布按件别而非急度：外贸与一般件公开，关键件少量秘密/极少数机密，其余内部。
+    优先级不等于密级——P0 单必须排得动，只有少数关键件高于计划员的可读范围。"""
+    if "外贸" in customer or product.priority_class == "一般件" and index % 5 == 0:
+        return "公开"
+    if product.priority_class == "关键件" and index % 17 == 0:
+        return "机密"
+    if product.priority_class == "关键件" and index % 6 == 0:
+        return "秘密"
+    return "内部"
 
 
 def _seed(db: Session) -> dict:
@@ -265,6 +402,7 @@ def _seed(db: Session) -> dict:
         resource = Resource(
             code=code, name=name, domain=domain, plant=plant, capacity_hours=capacity,
             efficiency=efficiency, bottleneck=bottleneck, status="running",
+            machine_count=MACHINE_COUNTS.get(name, 1), capabilities=[domain],
         )
         db.add(resource)
         resources.append(resource)
@@ -306,6 +444,7 @@ def _seed(db: Session) -> dict:
             progress = 0
         days = (18 + (i * 3) % 14) if priority == "P0" else (36 + (i * 5) % 24 if priority == "P1" else (56 + (i * 7) % 26))
         due = NOW + timedelta(days=days)
+        customer = "空军装备部" if i % 3 == 0 else ("中国航发" if i % 3 == 1 else "外贸客户")
         order = Order(
             order_no=f"MO-2026-{i + 1:04d}",
             product_id=product.id,
@@ -313,11 +452,12 @@ def _seed(db: Session) -> dict:
             qty=1 + (i % 4),
             priority=priority,
             plant="一厂" if i % 2 == 0 else "二厂",
-            customer="空军装备部" if i % 3 == 0 else ("中国航发" if i % 3 == 1 else "外贸客户"),
+            customer=customer,
             due_date=due,
             status=status,
             progress=progress,
             is_military=i % 10 != 9,
+            clearance=_order_clearance(i, customer, product),
             kit_status="齐套",
             created_at=NOW - timedelta(days=40 - i % 20),
             released_at=NOW - timedelta(days=30 - i % 15),
@@ -378,6 +518,7 @@ def _seed(db: Session) -> dict:
         failed_op.status = "返工"
 
     open_orders = [o for o in orders if o.status not in ("已完工", "已取消")]
+    _seed_kit_sources(db, products, orders, resources, next(u for u in users if u.role == "admin"))
     for order in open_orders[:52]:
         for checkpoint in ("pre_schedule", "post_schedule", "pre_start"):
             persist_check(db, order, checkpoint)
@@ -391,7 +532,7 @@ def _seed(db: Session) -> dict:
     baseline.baseline = True
     baseline.applied_at = NOW
     baseline.approved_at = NOW
-    freeze_until = NOW + timedelta(days=3)
+    freeze_until = NOW + timedelta(days=int(DEFAULT_SETTINGS["freeze_days"]))
     for item in db.query(PlanItem).filter(PlanItem.plan_id == baseline.id).all():
         op = db.get(Operation, item.operation_id) if item.operation_id else None
         if op:
@@ -524,6 +665,7 @@ def _seed(db: Session) -> dict:
         assess_disturbance(db, change)
         change.occurred_at = occurred
         changes.append(change)
+    relabel_disturbance_clearance(db)
     db.flush()
 
     fault_change = changes[0]

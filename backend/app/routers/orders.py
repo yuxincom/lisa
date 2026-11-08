@@ -5,8 +5,11 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..deps import require
+from ..deps import clearance_cfg, plant_cfg, require
 from ..models import KitCheck, Operation, Order, PlanItem, Resource, User
+from ..services import clearance as clr
+from ..services import plants as pl
+from ..services.audit import log_user_action
 from ..services.kits import serialize_check
 from ..services.metrics import latest_baseline
 from ..services.serializers import order_to_dict
@@ -14,19 +17,44 @@ from ..services.serializers import order_to_dict
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 
+def _cfg(db: Session) -> dict:
+    return clearance_cfg(db)
+
+
+def _scope(db: Session) -> tuple[dict, dict]:
+    """读取范围两件套：密级 + 厂区。两条必须同时成立，放宽一条等于没过滤。"""
+    return clearance_cfg(db), plant_cfg(db)
+
+
 @router.get("/summary")
 def summary(db: Session = Depends(get_db), user: User = Depends(require("plans:read"))):
+    cfg, pcfg = _scope(db)
     statuses = ["待排产", "已排产", "执行中", "逾期", "已完工", "冻结"]
-    by_status = [{"status": s, "count": db.query(Order).filter(Order.status == s).count()} for s in statuses]
+
+    def scoped():
+        return db.query(Order).filter(
+            clr.visible_filter(user, Order.clearance, cfg),
+            pl.visible_filter(user, Order.plant, pcfg),
+        )
+
+    by_status = [{"status": s, "count": scoped().filter(Order.status == s).count()} for s in statuses]
     by_priority = []
     for priority in ["P0", "P1", "P2"]:
-        by_priority.append({"priority": priority, "count": db.query(Order).filter(Order.priority == priority).count()})
+        by_priority.append({"priority": priority, "count": scoped().filter(Order.priority == priority).count()})
     return {
-        "total": db.query(Order).count(),
+        "total": scoped().count(),
         "by_status": by_status,
         "by_priority": by_priority,
-        "military": db.query(Order).filter(Order.is_military.is_(True)).count(),
-        "kit_risk": db.query(Order).filter(Order.kit_status != "齐套").count(),
+        "military": scoped().filter(Order.is_military.is_(True)).count(),
+        "kit_risk": scoped().filter(Order.kit_status != "齐套").count(),
+        "hidden_by_clearance": clr.hidden_count(db, Order, user, cfg),
+        "hidden_by_level": clr.hidden_breakdown(db, Order, user, cfg),
+        "hidden_by_plant": pl.hidden_breakdown(db, Order, user, pcfg),
+        "clearance_levels": cfg["levels"] if cfg["enabled"] else [],
+        "clearance_enabled": cfg["enabled"],
+        "plants": pcfg["names"],
+        "plants_enabled": pcfg["enabled"],
+        "your_plants": pl.allowed(user, pcfg),
     }
 
 
@@ -34,13 +62,21 @@ def summary(db: Session = Depends(get_db), user: User = Depends(require("plans:r
 def list_orders(
     status: str | None = None,
     priority: str | None = None,
+    plant: str | None = None,
     search: str = "",
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(require("plans:read")),
 ):
-    query = db.query(Order)
+    cfg, pcfg = _scope(db)
+    query = db.query(Order).filter(
+        clr.visible_filter(user, Order.clearance, cfg),
+        pl.visible_filter(user, Order.plant, pcfg),
+    )
+    if plant:
+        # 界面选厂区只能是「在我能看的范围里再收窄」，不能借这个参数越范围
+        query = query.filter(pl.label_expr(Order.plant, pcfg) == plant)
     if status:
         query = query.filter(Order.status == status)
     if priority:
@@ -85,14 +121,41 @@ def list_orders(
                 },
             )
         )
-    return {"items": items, "total": total, "limit": limit, "offset": offset}
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hidden_by_clearance": clr.hidden_count(db, Order, user, cfg),
+        "hidden_by_plant": pl.hidden_count(db, Order, user, pcfg),
+    }
 
 
 @router.get("/{order_id}")
 def order_detail(order_id: int, db: Session = Depends(get_db), user: User = Depends(require("plans:read"))):
+    cfg, pcfg = _scope(db)
     order = db.get(Order, order_id)
     if not order:
         raise HTTPException(status_code=404, detail={"code": "ORDER_NOT_FOUND", "message": "订单不存在"})
+    if not clr.can_read(user, order, cfg) or not pl.can_read(user, order, pcfg):
+        denied_by = "clearance" if not clr.can_read(user, order, cfg) else "plant"
+        log_user_action(
+            db, user, f"{denied_by}.denied", "order", order.order_no, result="denied",
+            detail={"required": order.clearance if denied_by == "clearance" else order.plant,
+                    "reason": "读取范围（密级 / 厂区）过滤命中"},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "CLEARANCE_DENIED" if denied_by == "clearance" else "PLANT_DENIED",
+                "message": (
+                    f"{user.username} 的密级不足以查看工单 {order.order_no}"
+                    if denied_by == "clearance"
+                    else f"{user.username} 的厂区范围不含工单 {order.order_no} 所在的 {order.plant}"
+                ),
+            },
+        )
     operations = db.query(Operation).filter(Operation.order_id == order.id).order_by(Operation.seq).all()
     resources = {r.id: r for r in db.query(Resource).all()}
     checks = (

@@ -1,0 +1,5 @@
+code,kind,domain,name,status,life_remaining,owner
+TZ-J01,tooling,机加,五轴叶盘定位工装,可用,,工装室
+TZ-G01,tooling,锻造,模锻模具体,检修,,工装室
+CT-J01,cutter,机加,硬质合金铣刀 D16,可用,78.5,工具室
+CT-J02,cutter,机加,可转位面铣刀 D63,可用,12,工具室

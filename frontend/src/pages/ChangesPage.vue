@@ -19,6 +19,7 @@ import {
 import PageHeader from '@/components/PageHeader.vue'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
+import ClearanceBadge from '@/components/ClearanceBadge.vue'
 import BaseModal from '@/components/BaseModal.vue'
 
 interface Summary {
@@ -29,6 +30,8 @@ interface Summary {
   types: { type: string; count: number }[]
   sla_minutes: number
   sla_target: string
+  hidden_by_clearance?: number
+  clearance_enabled?: boolean
 }
 
 const TYPE_OPTIONS = ['fault', 'material', 'insert', 'rework', 'order_change', 'inspection', 'ecn']
@@ -74,6 +77,7 @@ let searchTimer: number | null = null
 const canCreate = computed(() => auth.can('changes:create'))
 const canApprove = computed(() => auth.can('changes:approve'))
 const openChanges = computed(() => list.value.filter((item) => item.status !== '已关闭'))
+const hiddenChanges = computed(() => summary.value?.hidden_by_clearance ?? 0)
 
 const statusOptions = computed(() => {
   const counts = summary.value?.counts || []
@@ -98,6 +102,7 @@ const sla = computed(() => {
   const ratio = Math.min(100, (elapsed / target) * 100)
   return {
     elapsed,
+    display: elapsed < 1 ? `${Math.max(1, Math.round(elapsed * 60))} 秒` : `${elapsed.toFixed(1)} 分钟`,
     target,
     ratio,
     breached: elapsed > target,
@@ -377,7 +382,10 @@ onBeforeUnmount(() => {
       <section class="change-list panel">
         <div class="panel-head">
           <div class="panel-title"><span class="title-mark" />事件队列</div>
-          <span class="panel-sub">{{ list.length }} 条</span>
+          <span class="panel-sub">
+            {{ list.length }} 条
+            <template v-if="hiddenChanges > 0"> · {{ hiddenChanges }} 条因密级未显示</template>
+          </span>
         </div>
         <div class="change-scroll">
           <div v-if="listLoading && !list.length" class="skeleton" style="height: 220px; margin: 12px" />
@@ -400,12 +408,16 @@ onBeforeUnmount(() => {
                 </span>
                 <span class="mono fs-12 muted">{{ change.code }}</span>
                 <StatusBadge :status="change.status" :label="change.status" />
+                <ClearanceBadge :level="change.clearance" />
               </div>
               <div class="cc-title">{{ change.title }}</div>
               <div class="cc-meta">
                 <span>{{ CHANGE_TYPE_LABEL[change.type] || change.type }}</span>
                 <span>{{ relativeTime(change.occurred_at) }}</span>
                 <span v-if="change.impact">影响 {{ change.impact.summary.affected_orders }} 单</span>
+                <span v-if="(change.redacted_affected || 0) > 0" class="text-warning">
+                  {{ change.redacted_affected }} 单因密级隐去
+                </span>
               </div>
               <div v-if="change.options?.plans?.length" class="cc-plans">
                 <span class="badge badge-accent">{{ change.options.plans.length }} 个方案待审</span>
@@ -469,7 +481,7 @@ onBeforeUnmount(() => {
 
             <div v-if="sla && detail.status !== '已关闭'" class="sla-bar">
               <div class="sla-head">
-                <span><AppIcon name="clock" :size="12" /> 评估 SLA {{ sla.elapsed.toFixed(1) }} / {{ sla.target }} 分钟</span>
+                <span><AppIcon name="clock" :size="12" /> 评估耗时 {{ sla.display }} / SLA {{ sla.target }} 分钟</span>
                 <span :class="sla.breached ? 'text-danger' : 'text-warning'">
                   {{ sla.breached ? '已超时，自动升级生产指挥部' : `剩余 ${sla.remaining.toFixed(1)} 分钟` }}
                 </span>
@@ -504,10 +516,20 @@ onBeforeUnmount(() => {
               </div>
             </section>
 
+            <div v-if="detail.impact.summary.assumptions?.length" class="assumption-note">
+              <AppIcon name="alert" :size="13" />
+              <div>
+                <strong>本次推演包含假设</strong>
+                <ul>
+                  <li v-for="item in detail.impact.summary.assumptions" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+            </div>
+
             <section class="panel ripple-panel">
               <div class="panel-head">
-                <div class="panel-title"><span class="title-mark" />图谱涟漪推演</div>
-                <span class="panel-sub">{{ detail.impact.summary.resource }} · Allen 时态约束</span>
+                <div class="panel-title"><span class="title-mark" />影响涟漪推演（依赖图实算）</div>
+                <span class="panel-sub">{{ detail.impact.summary.resource }} · 按工序计划时间推算延误</span>
               </div>
               <div class="panel-body">
                 <div class="ripple-flow">
@@ -558,7 +580,12 @@ onBeforeUnmount(() => {
             <section class="panel">
               <div class="panel-head">
                 <div class="panel-title"><span class="title-mark" />受影响订单</div>
-                <span class="panel-sub">{{ detail.impact.affected_orders.length }} 单</span>
+                <span class="panel-sub">
+                  列出 {{ detail.impact.affected_orders.length }} / 共 {{ detail.impact.summary.affected_orders }} 单
+                  <template v-if="(detail.impact.redacted_affected || 0) > 0">
+                    · {{ detail.impact.redacted_affected }} 单因密级隐去
+                  </template>
+                </span>
               </div>
               <div class="panel-body flush">
                 <div class="table-wrap">
@@ -567,6 +594,7 @@ onBeforeUnmount(() => {
                       <tr>
                         <th>订单</th>
                         <th>优先级</th>
+                        <th>密级</th>
                         <th>交期</th>
                         <th>当前完工</th>
                         <th>预计完工</th>
@@ -582,6 +610,7 @@ onBeforeUnmount(() => {
                           <div class="fs-12 muted truncate">{{ order.product_name }}</div>
                         </td>
                         <td><span class="priority" :class="`priority-${order.priority}`">{{ order.priority }}</span></td>
+                        <td><ClearanceBadge :level="order.clearance" /></td>
                         <td>{{ formatDateTime(order.due_date) }}</td>
                         <td>{{ formatDateTime(order.current_finish) }}</td>
                         <td>{{ formatDateTime(order.projected_finish) }}</td>
@@ -838,6 +867,22 @@ onBeforeUnmount(() => {
 .impact-card strong { font-size: 23px; line-height: 1.15; }
 .impact-card strong small { font-size: 11px; color: var(--text-3); }
 .impact-card em { font-style: normal; font-size: 9.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.assumption-note {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin: -4px 0 14px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px dashed var(--border-strong);
+  background: var(--panel-inset);
+  font-size: 11px;
+  color: var(--text-2);
+}
+.assumption-note :deep(svg) { flex: none; margin-top: 1px; color: var(--warning); }
+.assumption-note strong { display: block; font-size: 11px; margin-bottom: 3px; color: var(--text-1); }
+.assumption-note ul { margin: 0; padding-left: 16px; line-height: 1.6; color: var(--text-3); }
 
 .ripple-panel .panel-body { display: flex; flex-direction: column; gap: 16px; }
 .ripple-flow {

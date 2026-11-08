@@ -5,6 +5,7 @@ export interface User {
   role: string
   role_label: string
   clearance: string
+  plants: string[]
   department: string
   avatar_color: string
 }
@@ -50,6 +51,8 @@ export interface HardCheck {
   passed: boolean
   count: number
   samples: string[]
+  evaluated?: boolean
+  message?: string
 }
 
 export interface SoftViolation {
@@ -73,6 +76,8 @@ export interface PlanSummary {
   objective: string
   reasoning: string[]
   hard_checks: HardCheck[]
+  hard_count?: number
+  unevaluated?: { code: string; title: string; reason: string }[]
   soft_violations: SoftViolation[]
   generated_by: string
   solver: string
@@ -253,6 +258,7 @@ export interface DashboardOverview {
     updated_at: string
   } | null
   changes: Change[]
+  clearance?: ClearanceContext
   risk_orders: {
     order_id: number
     order_no: string
@@ -301,6 +307,75 @@ export interface AgentStep {
   observation: string
   duration_ms: number
   status: string
+  reasoning?: 'llm' | 'fallback' | 'deterministic' | string
+  fallback_reason?: string
+  tool?: { tool: string; ms?: number; chars?: number; error?: string } | null
+}
+
+export interface LlmRunMeta {
+  mode: 'llm' | 'fallback' | string
+  model: string | null
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  reason: string | null
+  error: { code: string; message: string } | null
+}
+
+export interface LlmConfig {
+  enabled: boolean
+  base_url: string
+  model: string
+  api_key_env: string
+  timeout_seconds: number
+  max_steps: number
+  temperature: number
+  internal_only: boolean
+  internal_suffixes: string[]
+  redact_fields: string[]
+  max_observation_chars: number
+}
+
+export interface McpTool {
+  name: string
+  description: string
+  input_schema: { type: string; properties: Record<string, Record<string, unknown>>; required?: string[] }
+  read_only: boolean
+  when_to_use: string
+}
+
+export interface McpCatalog {
+  protocol_version: string
+  server: { name: string; version: string; title: string }
+  instructions: string
+  read_only: boolean
+  endpoint: string
+  tools: McpTool[]
+  count: number
+}
+
+export interface LlmStatus {
+  config: LlmConfig
+  defaults: LlmConfig
+  credential_present: boolean
+  credential_source: string | null
+  mcp: {
+    protocol_version: string
+    server: { name: string; version: string; title: string }
+    instructions: string
+    endpoint: string
+    tools: { name: string; description: string }[]
+  }
+  runs: { window: number; llm: number; fallback: number; last: LlmRunMeta | null }
+}
+
+export interface LlmTestResult {
+  ok: boolean
+  model: string
+  latency_ms: number
+  echo: string
+  endpoint: string
+  credentials: string
 }
 
 export interface AgentRun {
@@ -320,6 +395,96 @@ export interface AgentRun {
   output: Record<string, unknown>
   steps?: AgentStep[]
   plans?: Plan[]
+}
+
+export interface Job {
+  id: number
+  kind: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | string
+  progress: number
+  attempt: number
+  max_attempts: number
+  worker: string
+  created_by: string
+  payload: Record<string, unknown>
+  result: Record<string, unknown>
+  error: Record<string, unknown>
+  queued_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  duration_seconds: number | null
+}
+
+export interface QueueHealth {
+  counts: Record<string, number>
+  queued: number
+  running: number
+  worker_enabled: boolean
+  worker_alive: boolean
+  worker_id: string
+  kinds: string[]
+  oldest_queued_seconds: number | null
+  silent_workers: number
+}
+
+export interface BackupItem {
+  file: string
+  created_at?: string
+  app_version?: string
+  dialect?: string
+  total_rows?: number
+  tables?: number
+  audit_head_seq?: number
+  bytes?: number
+  has_checksum?: boolean
+  unreadable?: boolean
+}
+
+export interface BackupBundle {
+  dump: string
+  restore: string
+  note: string
+}
+
+export interface BackupOverview {
+  items: BackupItem[]
+  backup_dir: string
+  keep: number
+  dialect: string
+  native: BackupBundle
+  restore: string
+}
+
+export interface BackupCreated {
+  file: string
+  audit_ref: string
+  path: string
+  bytes: number
+  checksum: string
+  payload_digest: string
+  created_at: string
+  dialect: string
+  total_rows: number
+  row_counts: Record<string, number>
+  audit_head_seq: number
+  audit_head_hash: string
+  pruned: string[]
+  native: BackupBundle
+}
+
+export interface BackupVerified {
+  ok: boolean
+  file: string
+  created_at?: string
+  app_version?: string
+  dialect?: string
+  total_rows?: number
+  checksum?: string
+  payload_digest?: string
+  audit_head_seq?: number
+  audit_head_hash?: string
+  unknown_tables: string[]
+  missing_tables: string[]
 }
 
 export interface AgentCatalog {
@@ -343,6 +508,8 @@ export interface Change {
   options?: { plans: ChangePlanOption[] } | { plans: [] }
   resolved_at: string | null
   reporter: string
+  clearance?: string
+  redacted_affected?: number
 }
 
 export interface ChangePlanOption {
@@ -368,6 +535,9 @@ export interface ChangeImpact {
     sla_minutes: number
     elapsed_minutes: number
     confidence: number
+    assumptions?: string[]
+    delay_hours?: number
+    grounded_orders?: number
     assessed_at: string
     engine: string
   }
@@ -384,7 +554,9 @@ export interface ChangeImpact {
     operations: number
     status: string
     kit_status: string
+    clearance?: string
   }[]
+  redacted_affected?: number
   graph: {
     nodes: { id: string; label: string; type: string; level: number; meta: Record<string, unknown> }[]
     edges: { source: string; target: string; kind: string }[]
@@ -419,10 +591,41 @@ export interface KitCheck {
 }
 
 export interface KitOverview {
-  by_checkpoint: { checkpoint: string; label: string; total: number; passed: number; rate: number; missing: number; blocked: number }[]
+  by_checkpoint: { checkpoint: string; label: string; total: number; passed: number; rate: number; missing: number; blocked: number; pending: number }[]
   post_schedule_rate: number
   gap_owners: { owner: string; count: number }[]
   updated_at: string
+  scoped?: boolean
+  hidden_orders_by_clearance?: number
+}
+
+export interface KitSourceFreshness {
+  rows: number
+  as_of: string | null
+  age_hours: number | null
+}
+
+export interface AdapterSource {
+  name: string
+  kind: string
+  channel: string
+  interval_minutes: number
+  enabled: boolean
+  last_sync: string | null
+  rows: number | null
+  latency_ms: number | null
+  error: { code: string; message: string } | null
+  next_sync: string | null
+}
+
+export interface AdapterOverview {
+  sources: AdapterSource[]
+  freshness: Record<string, KitSourceFreshness>
+}
+
+export interface AdapterRunResult {
+  ran: { name: string; kind?: string; channel?: string; rows?: number; error?: { code: string; message: string } }[]
+  skipped: number
 }
 
 export interface QualityDimension {
@@ -546,8 +749,40 @@ export interface AuditStats {
   actions: { action: string; count: number }[]
 }
 
-export interface SecurityInfo {
-  write_shield: { enabled: boolean; policy: string; blocked_writes: number; target: string; status: string }
+export interface ClearanceConfig {
+  enabled: boolean
+  levels: string[]
+  data_default: string
+  report_hidden: boolean
+}
+
+export interface ClearanceReport extends ClearanceConfig {
+  your_level: string | null
+  you_can_read: string[]
+  orders_by_level: Record<string, number>
+  orders_outside_levels: Record<string, number>
+  users_by_level: Record<string, number>
+  visible_levels: number
+  total_levels: number
+}
+
+export interface PlantConfig {
+  enabled: boolean
+  names: string[]
+  data_default: string
+}
+
+export interface PlantReport extends PlantConfig {
+  your_scope: string[] | null
+  orders_by_plant: Record<string, number>
+  orders_outside_plants: Record<string, number>
+  people: { username: string; name: string; role: string; plants: string[] }[]
+  unknown_claimed_plants: string[]
+  resource_count: number
+  hidden_orders: Record<string, number>
+}
+
+export interface SecurityInfo {  write_shield: { enabled: boolean; policy: string; blocked_writes: number; target: string; status: string }
   abac: {
     matrix: { role: string; label: string; permissions: string[]; permission_labels?: string[]; count?: number }[]
     denied_events: number
@@ -557,6 +792,8 @@ export interface SecurityInfo {
   audit: { hash_chain: string; worm: boolean; retention: string }
   encryption: { transport: string; desensitization: string; data_boundary: string }
   electronic_signature: { levels: string[]; algorithm: string }
+  clearance?: ClearanceReport
+  plants?: PlantReport
 }
 
 export interface SettingsValues {
@@ -568,6 +805,8 @@ export interface SettingsValues {
   solver_timeout_seconds: number
   auto_escalate?: boolean
   write_shield?: boolean
+  clearance?: ClearanceConfig
+  plants?: PlantConfig
   [key: string]: unknown
 }
 
@@ -591,6 +830,43 @@ export interface MetaInfo {
   architecture?: { layer: string; name: string; detail: string }[]
 }
 
+export interface ClearanceContext {
+  enabled: boolean
+  your_level: string | null
+  levels: string[]
+  hidden_orders: Record<string, number>
+}
+
+export interface AnchorRecord {
+  seq_from: number
+  seq_to: number
+  records: number
+  ts: string
+  actor?: string
+  chain_hash: string
+  anchor_hash?: string
+}
+
+export interface AnchorStatus {
+  file: string
+  exists: boolean
+  anchors: number
+  anchored_records: number
+  chain_ok: boolean
+  broken_at: { line: number; seq_to: number } | null
+  algo: string
+  secret_env: string
+  secret_configured: boolean
+  reason?: string
+  message?: string
+  last?: AnchorRecord | null
+  db_total?: number
+  db_head_hash?: string | null
+  unanchored_records?: number
+  drift?: string | null
+  history?: AnchorRecord[]
+}
+
 export interface Order {
   id: number
   order_no: string
@@ -598,6 +874,7 @@ export interface Order {
   product_name: string
   qty: number
   priority: string
+  clearance?: string
   plant: string
   customer: string
   due_date: string

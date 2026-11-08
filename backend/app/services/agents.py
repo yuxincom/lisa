@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from ..models import AgentRun, Approval, Disturbance, Operation, Order, Plan, User
+from . import llm
 from .audit import log_user_action
 from .impact import TYPE_LABEL, assess_disturbance, create_change_plans, create_disturbance
 from .kits import persist_check
@@ -124,8 +125,14 @@ def _step(idx: int, phase: str, title: str, thought: str, action: str, observati
     }
 
 
-def _make_run(db: Session, user: User, agent_code: str, scenario: str, steps: list[dict], output: dict, summary: str, simulated_minutes: float, plan_id: int | None = None) -> AgentRun:
+def _make_run(
+    db: Session, user: User, agent_code: str, scenario: str, steps: list[dict], output: dict, summary: str,
+    simulated_minutes: float, plan_id: int | None = None, brief: dict | None = None,
+) -> AgentRun:
     agent = next((a for a in AGENTS if a["code"] == agent_code), AGENTS[0])
+    orchestration = llm.orchestrate(db, user, steps, brief or {"scenario": scenario, "agent": agent_code})
+    steps = orchestration["steps"]
+    output = {**output, "llm": orchestration["meta"]}
     now = datetime.now().replace(microsecond=0)
     code = f"AR-{now:%Y%m%d%H%M%S}-{agent_code}-{uuid.uuid4().hex[:4].upper()}"
     run = AgentRun(
@@ -153,11 +160,18 @@ def _make_run(db: Session, user: User, agent_code: str, scenario: str, steps: li
             "agent": agent_code,
             "scenario": scenario,
             "simulated_minutes": simulated_minutes,
+            "reasoning": orchestration["meta"]["mode"],
+            "model": orchestration["meta"].get("model"),
             "plans": output.get("plans", []),
             "status": "succeeded",
         },
     )
     return run
+
+
+def supported_scenarios() -> tuple[str, ...]:
+    """入队前就能判掉的场景清单：把明显跑不通的任务塞进队列，只会让调度员等到一个失败。"""
+    return ("full", "night", "kit", "local", "change") + tuple(TYPE_LABEL)
 
 
 def run_scenario(db: Session, user: User, scenario: str, change_id: int | None = None, options: dict | None = None) -> AgentRun:
@@ -200,7 +214,7 @@ def _run_full(db: Session, user: User) -> AgentRun:
     plans = create_plan_batch(db, user, plan_type="full", scenarios=("A", "B", "C"))
     a_plan = plans[0]
     hard = a_plan.summary.get("hard_checks", [])
-    hard_failed = sum(1 for c in hard if not c.get("passed"))
+    hard_failed = sum(1 for c in hard if c.get("evaluated", True) and not c.get("passed"))
     late = a_plan.kpi.get("late_orders", 0)
     codes = " / ".join(p.code for p in plans)
     steps = [
@@ -255,6 +269,15 @@ def _run_full(db: Session, user: User) -> AgentRun:
         db, user, "C-01", "full", steps, output,
         f"夜间全量重排完成：{a_plan.kpi.get('orders')} 单 / {a_plan.kpi.get('operations')} 工序，A 方案准时率 {a_plan.kpi.get('on_time_rate')}%",
         106.4, a_plan.id,
+        brief={
+            "scenario": "夜间全量重排（C-01）",
+            "quality_gate": {"overall": quality["overall"], "passed": quality["gate"]["passed"]},
+            "plans": [p.code for p in plans],
+            "a_plan_kpi": a_plan.kpi,
+            "hard_failed": hard_failed,
+            "hard_unevaluated": [c.get("code") for c in hard if not c.get("evaluated", True)],
+            "soft_violations": len(a_plan.summary.get("soft_violations", [])),
+        },
     )
 
 
@@ -306,6 +329,14 @@ def _run_change(db: Session, user: User, change: Disturbance) -> AgentRun:
         db, user, agent_code, "change", steps, output,
         f"{TYPE_LABEL.get(change.type, change.type)}影响评估完成：{summary['affected_orders']} 单受影响，A/B 方案待审批",
         summary["elapsed_minutes"], plans[0].id if plans else None,
+        brief={
+            "scenario": f"扰动事件处置（{TYPE_LABEL.get(change.type, change.type)}）",
+            "event": {"code": change.code, "type": change.type, "severity": change.severity,
+                      "resource": summary.get("resource")},
+            "impact": {k: summary[k] for k in ("affected_orders", "affected_operations", "critical_orders",
+                                               "avg_delay_days", "max_late_days", "confidence")},
+            "plans": [p.code for p in plans],
+        },
     )
 
 
@@ -349,6 +380,16 @@ def _run_kit(db: Session, user: User, options: dict) -> AgentRun:
         db, user, "M-03", "kit", steps, output,
         f"齐套检查完成：{order.order_no}，{checks[-1].status}，缺口 {gap_count} 项",
         3.2,
+        brief={
+            "scenario": "齐套九要素三时点检查（M-03）",
+            "order_no": order.order_no,
+            "priority": order.priority,
+            "due_date": order.due_date.isoformat() if order.due_date else None,
+            "checks": output["checks"],
+            "unevaluated_elements": [
+                e.get("name") for e in (checks[-1].elements or []) if isinstance(e, dict) and e.get("status") == "unknown"
+            ],
+        },
     )
 
 
@@ -383,7 +424,8 @@ def _run_local(db: Session, user: User, options: dict) -> AgentRun:
         _step(4, "校验", "硬约束与规则复核",
               "原子级输出同样必须通过 HC 硬约束与规则引擎，只读建议不得绕过。",
               "shacl.validate() + rules.evaluate()",
-              f"硬约束违规 {sum(1 for c in plan.summary.get('hard_checks', []) if not c.get('passed'))} 项。", 1800),
+              f"硬约束违规 {plan.summary.get('hard_count', 0)} 项，"
+              f"未校验 {len(plan.summary.get('unevaluated', []))} 项。", 1800),
         _step(5, "输出", "只读建议归档",
               "A 级智能体不得写基线，建议方案归档给 M/C 级协调与调度员参考。",
               "output.archive(status=draft)",
@@ -398,4 +440,12 @@ def _run_local(db: Session, user: User, options: dict) -> AgentRun:
         db, user, agent_code, "local", steps, output,
         f"{domain}域局部排产建议完成：{kpi.get('orders')} 单，准时率 {kpi.get('on_time_rate')}%",
         27.0, plan.id,
+        brief={
+            "scenario": f"{domain} 域原子级排产建议（{agent_code}）",
+            "plan": plan.code,
+            "kpi": kpi,
+            "hard_count": plan.summary.get("hard_count", 0),
+            "unevaluated": plan.summary.get("unevaluated", []),
+            "unassigned_operations": plan.summary.get("unassigned_operations", 0),
+        },
     )

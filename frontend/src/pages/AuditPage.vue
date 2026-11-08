@@ -2,8 +2,9 @@
 import { computed, onMounted, ref } from 'vue'
 import { auditApi, systemApi } from '@/api'
 import { errorMessage } from '@/composables/useAsync'
+import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
-import type { AuditLog, AuditStats } from '@/types'
+import type { AnchorRecord, AnchorStatus, AuditLog, AuditStats } from '@/types'
 import {
   actionLabel,
   formatDateTime,
@@ -23,6 +24,8 @@ interface VerifyResult {
   last_hash: string
   algorithm: string
   verified_at: string
+  tamper_evident?: boolean
+  anchor?: AnchorStatus
 }
 
 const PAGE_SIZE = 100
@@ -35,6 +38,7 @@ const RESULT_OPTIONS = [
 ]
 
 const ui = useUiStore()
+const auth = useAuthStore()
 
 const stats = ref<AuditStats | null>(null)
 const logs = ref<AuditLog[]>([])
@@ -47,7 +51,23 @@ const resultFilter = ref('')
 const search = ref('')
 const verifying = ref(false)
 const verifyResult = ref<VerifyResult | null>(null)
+const anchoring = ref(false)
 const exporting = ref(false)
+
+const anchor = computed<AnchorStatus | undefined>(() => verifyResult.value?.anchor)
+const anchorLabel = computed(() => {
+  if (!anchor.value) return '未校验'
+  if (!anchor.value.secret_configured) return '密钥未配置'
+  if (!anchor.value.exists) return '未锚定'
+  if (anchor.value.broken_at) return `锚点链断在第 ${anchor.value.broken_at.line} 次`
+  if (!anchor.value.chain_ok) return '锚点与库内不符'
+  return `已锚定 ${anchor.value.anchors} 次`
+})
+const anchorTone = computed(() => {
+  if (!anchor.value) return 'muted'
+  if (!anchor.value.secret_configured || !anchor.value.exists) return 'warning'
+  return anchor.value.chain_ok ? 'success' : 'danger'
+})
 
 const detailOpen = ref(false)
 const activeLog = ref<AuditLog | null>(null)
@@ -120,6 +140,22 @@ async function verify() {
     ui.error('校验失败', errorMessage(err))
   } finally {
     verifying.value = false
+  }
+}
+
+async function runAnchor() {
+  anchoring.value = true
+  try {
+    const record: AnchorRecord = await auditApi.anchor()
+    await verify()
+    ui.success(
+      '链尾已锚定',
+      `本次覆盖 seq ${record.seq_from}–${record.seq_to}，锚点写入库外文件`,
+    )
+  } catch (err) {
+    ui.error('锚定失败', errorMessage(err))
+  } finally {
+    anchoring.value = false
   }
 }
 
@@ -237,6 +273,39 @@ onMounted(async () => {
               <span>存储策略</span>
               <strong>WORM · 只追加</strong>
             </div>
+          </div>
+          <div class="anchor-strip">
+            <div class="anchor-info">
+              <span class="anchor-title">库外锚点</span>
+              <StatusBadge
+                v-if="anchor"
+                :label="anchorLabel"
+                :tone="anchorTone"
+              />
+              <span v-else class="badge badge-muted">未校验</span>
+              <span class="anchor-detail">
+                <template v-if="anchor?.exists">
+                  已锚定 {{ anchor.anchored_records }} 条 · 未锚定 {{ anchor.unanchored_records ?? 0 }} 条 ·
+                  最近 {{ formatDateTime(anchor.last?.ts) }}
+                </template>
+                <template v-else-if="anchor && !anchor.secret_configured">
+                  锚定需要环境变量 <span class="mono">{{ anchor.secret_env }}</span> 提供密钥；密钥只从环境读，不落库、不进日志
+                </template>
+                <template v-else>还没有锚点文件：链尾只存在于库里一份，建议立即锚定</template>
+              </span>
+              <span v-if="anchor?.message" class="anchor-warn">{{ anchor.message }}</span>
+            </div>
+            <button
+              v-if="auth.can('audit:anchor')"
+              class="btn btn-ghost"
+              type="button"
+              :disabled="anchoring"
+              @click="runAnchor"
+            >
+              <span v-if="anchoring" class="spinner" />
+              <AppIcon v-else name="shield" :size="14" />
+              锚定当前链尾
+            </button>
           </div>
         </div>
       </section>
@@ -658,5 +727,39 @@ onMounted(async () => {
   .chain-meta {
     grid-template-columns: 1fr 1fr;
   }
+}
+
+.anchor-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--panel-inset);
+  border: 1px solid var(--border);
+}
+.anchor-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.anchor-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  letter-spacing: 0.04em;
+}
+.anchor-detail {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.anchor-warn {
+  flex: 1 1 100%;
+  font-size: 12px;
+  color: var(--warning);
 }
 </style>
